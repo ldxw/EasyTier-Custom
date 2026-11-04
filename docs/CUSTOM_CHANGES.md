@@ -5,8 +5,8 @@
 ## 上游来源与许可证
 
 - 上游仓库：https://github.com/EasyTier/EasyTier
-- 本项目仓库：https://github.com/225284228a-droid/EasyTier-Custom
-- 最近已合入的上游基线：`5af90471bfe654d097f7e488a2699f2850db7dd2`（2026-10-19 合入）。
+- 本项目仓库：https://github.com/ldxw/EasyTier-Custom
+- 最近已合入的上游基线：`48ccc56a1aa4a63ec5192f71e85b330b155f0136`（2026-10-27 的上游提交，2026-10-28 由 `f7d12596` 合入）。
 - 开源协议与该上游版本一致：GNU Lesser General Public License v3.0（LGPL-3.0），见根目录 [LICENSE](../LICENSE)。保留上游历史、作者归属及第三方组件各自的许可证；本项目修改按同一项目许可证发布。
 - 本文对比上述固定基线，不把“尚未合入上游后续提交”当作本项目主动删除的功能。
 
@@ -154,6 +154,23 @@
 
 详细流量说明见 [network-telemetry.md](network-telemetry.md)。
 
+### CI 与上游工作流的差异
+
+本项目的构建、测试和发布流程与上游不共用同一套工作流。上游在 `.github/workflows/` 下放了十三个工作流（加一个 `Dockerfile`），用 `core.yml`/`gui.yml`/`mobile.yml`/`test.yml`/`nightly*.yml` 等覆盖全平台矩阵、定时构建与自动发布；本仓库换成了按需精简的自有价值链，`.github/workflows/` 下只有六个文件（`Dockerfile`、`build.yml`、`checks.yml`、`docker.yml`、`go-artifacts.yml`、`release.yml`）。
+
+- **自研入口**：`build.yml` 负责发布编译、打包、上传与旧产物清理；`checks.yml` 负责测试与静态检查；`go-artifacts.yml` 在 `main` 推送后按路径变化重新生成 `easytier-go` 的内嵌 WASI 核心和 protobuf 绑定并回推提交（上游对应的 `go.yml` 只是测试）。`docker.yml` 和 `release.yml` 沿用上游的“手动指定一次成功 build 的 run ID”模式，但只消费本仓库自己的产物。
+- **自研脚本与复合 action**：`scripts/build-config.js`（编译矩阵与产物清单的单一来源）、`prepare-build.js`、`build-plan.test.js`、`build-core.sh`、`package-build.js`、`check-build-results.js`、`clear-shared-caches.js`、`prune-build-artifacts.cjs`、`copy-windows-drivers.sh`、`verify-windows-runtime.ps1` 及对应单测，加上 `actions/shared-resources/action.yml` 与 `.github/tauri-ci.json`，上游都没有。
+- **删除的上游文件**：`workflows/` 下的 `core.yml`、`gui.yml`、`test.yml`、`go.yml`、`js.yml`、`nix.yml`、`mobile.yml`、`ohos.yml`、`nightly.yml`、`nightly-retry.yml`、`nightly-release.yml`，以及 `scripts/` 下的 `nightly-build.js`、`nightly-release.js`、`nightly-release.test.js`。其中 `core.yml` 依赖被一并删除的 nightly 脚本，原样复制进来会直接失败。
+- **同名但已改写的文件**：`CI.md`、`CI.zh-CN.md`、`docker.yml`、`release.yml`、`scripts/builds.test.js`、`scripts/validate-release-builds.js`、`actions/prepare-build/action.yml`、`actions/prepare-pnpm/action.yml`。这些文件的结构来自上游，内容已按本仓库的矩阵与产物约定重写。
+- **Docker 原料**：五个 musl 目标（`x86_64`、`armhf`、`armv7hf`、`aarch64`、`riscv64`）由 `build.yml` 的 core 矩阵编译并作为 artifact 上传，`docker.yml` 只下载与打包，不编译任何代码。其中 `x86_64` 同时是发布目标，另外四个只供镜像使用。
+
+同步上游时注意以下几点：
+
+1. 常规 `git merge` 不会删除这些自研文件——上游不存在它们的提交记录，合并只会带来两侧都存在的新改动。真正的覆盖风险来自整体复制（`cp -r`、`git checkout <upstream> -- .github/`）或冲突时无差别取对方版本。
+2. 八个同名文件若产生冲突，本仓库版本是有效的一方；按文件判断，不要整体 `--theirs`。
+3. 上游**新增**的工作流会被合并直接带进来，合并后需要检查 `.github/workflows/` 是否多出文件并评估是否删除。
+4. 合并完成后跑 `pnpm test:ci-scripts`（即 `node --test .github/scripts/*.test.js .github/scripts/*.test.cjs`）和 `actionlint -no-color .github/workflows/*.yml`；改动编译矩阵或产物清单时，`build-plan.test.js` 会同时校验 core/gui/android/check/docker 与发布产物数量。
+
 ## 常用新增配置
 
 以下为选项位置和当前默认值，不建议不加区分地全部开启：
@@ -187,7 +204,7 @@
 沿用仓库的 Rust 工具链和构建方式（`rust-toolchain.toml` 当前指定 Rust 1.95），原有可执行文件名称仍为 EasyTier 系列。构建示例：
 
 ```sh
-git clone https://github.com/225284228a-droid/EasyTier-Custom.git
+git clone https://github.com/ldxw/EasyTier-Custom.git
 cd EasyTier-Custom
 cargo build --release --locked -p easytier
 ```
@@ -199,8 +216,10 @@ cargo build --release --locked -p easytier
 Git 历史保留了上游提交与本项目提交。克隆后可查看完整差异与变更记录：
 
 ```sh
-git diff 99db92a3aeb3109efe1ace5a4a3e2a1bf3840ed7 HEAD
-git log --oneline 99db92a3aeb3109efe1ace5a4a3e2a1bf3840ed7..HEAD
+git diff 48ccc56a1aa4a63ec5192f71e85b330b155f0136 HEAD
+git log --oneline 48ccc56a1aa4a63ec5192f71e85b330b155f0136..HEAD
 ```
+
+这里的基线是最近一次已合入的上游提交；上游继续前进后，两者之间会多出尚未合入的上游提交，需要先同步再对比。
 
 原版 README 的安装脚本、官方 Web 服务、发布下载、徽章和赞助链接仍指向上游。使用本项目功能请构建本仓库，问题请提交到本项目 Issues。
