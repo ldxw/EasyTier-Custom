@@ -72,17 +72,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # 不写 repo：默认取当前仓库。产物形态与上游一致——artifact 名即目录名，
-      # 内容为 easytier-core / easytier-cli 两个裸二进制。
+      # 用官方 download-artifact：同一次 build 里 docker 目录是默认打包的 zip，
+      # 发布产物是 archive:false 的裸文件，两者混在一起只有官方 v4+ 的客户端
+      # 能按各自的形态落盘（第三方 dawidd6 会把裸文件也当 zip 解，报 END header）。
+      # 不写 repository：默认取当前仓库；run-id 已足够定位，无需 workflow 名。
       - name: Download artifact
         id: download-artifact
-        uses: dawidd6/action-download-artifact@v11
+        uses: actions/download-artifact@v8
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: ${{ inputs.run_id }}
-          workflow: build.yml
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.run_id }}
+          pattern: 'easytier-linux-{x86_64,armhf,armv7hf,aarch64,riscv64}'
           path: downloads
-          if_no_artifact_found: fail
+          merge-multiple: false
       # 同一次 build 还产出了发布用的归档、GUI 安装包和 APK。只把五个 Docker 目录
       # 搬进构建上下文，既缩小 buildx 上下文，也让 Dockerfile 的 cp 路径保持确定。
       # 下载不校验 run 的结论，缺一个平台就在 buildx 阶段变成「cp 不到文件」的
