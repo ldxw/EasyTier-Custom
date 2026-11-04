@@ -1,12 +1,20 @@
 name: EasyTier Docker
 
+# 两阶段形态，与上游一致：先由 .github/workflows/docker-artifacts.yml 在本库
+# 产出五个平台的 musl 静态二进制 artifact，再由本工作流按 run_id 拉取**本库**
+# 的 artifact 打包成多架构镜像。
+#
+# 与上游 docker.yml 的差别只有归属信息：
+#   - artifact 来自本仓库，不再是 EasyTier/EasyTier
+#   - 镜像推 ghcr.io/ldxw/easytier-custom，Docker Hub 段保持注释
+#   - run_id 指向本库 docker-artifacts.yml 的一次成功运行
+
 on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: 'The run id of EasyTier-Core Action in EasyTier repo'
+        description: 'The run id of Docker Artifacts workflow in this repository'
         type: number
-        default: 10228239965
         required: true
       image_tag:
         description: 'Tag for this image build'
@@ -24,9 +32,17 @@ on:
         default: false
         required: true
 
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ldxw/easytier-custom
+
 jobs:
   docker:
-    if: contains('["KKRainbow"]', github.actor)
+    if: github.actor == github.repository_owner
     runs-on: ubuntu-latest
     steps:
       -
@@ -45,53 +61,63 @@ jobs:
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      -
-        name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # - name: Login to Docker Hub
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: login github container registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # 不写 repo：默认取当前仓库。产物形态与上游一致——artifact 名即目录名，
+      # 下载后得到 docker_context/easytier-linux-<arch>/{easytier-core,easytier-cli}。
       - name: Download artifact
         id: download-artifact
         uses: dawidd6/action-download-artifact@v11
         with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           run_id: ${{ inputs.run_id }}
-          repo: EasyTier/EasyTier
+          workflow: docker-artifacts.yml
           path: docker_context
-      - name: List files
+          if_no_artifact_found: fail
+      # 下载不校验 run 的结论，缺一个平台就在 buildx 阶段变成「cp 不到文件」的
+      # 晦涩错误。先在这里显式报出缺哪个 arch。
+      - name: Verify artifact layout
         run: |
-          ls -l -R .
+          set -euo pipefail
+          missing=0
+          for arch in x86_64 armhf armv7hf aarch64 riscv64; do
+            dir="docker_context/easytier-linux-${arch}"
+            for bin in easytier-core easytier-cli; do
+              if [[ ! -s "${dir}/${bin}" ]]; then
+                echo "::error::Missing ${dir}/${bin}"
+                missing=1
+              fi
+            done
+          done
+          [[ $missing -eq 0 ]] || exit 1
+          ls -l -R docker_context
       - name: Prepare Docker tags
         id: tags
         run: |
-          # Base tags with version
-          DOCKERHUB_TAGS="easytier/easytier:${{ inputs.image_tag }}"
-          GHCR_TAGS="ghcr.io/easytier/easytier:${{ inputs.image_tag }}"
+          set -euo pipefail
 
-          # Add latest tags if requested
+          # 只推 GHCR
+          TAGS="${IMAGE}:${{ inputs.image_tag }}"
+
           if [[ "${{ inputs.mark_latest }}" == "true" ]]; then
-            DOCKERHUB_TAGS="${DOCKERHUB_TAGS},easytier/easytier:latest"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:latest"
+            TAGS="${TAGS},${IMAGE}:latest"
           fi
 
-          # Add unstable tags if requested
           if [[ "${{ inputs.mark_unstable }}" == "true" ]]; then
-            DOCKERHUB_TAGS="${DOCKERHUB_TAGS},easytier/easytier:unstable"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:unstable"
+            TAGS="${TAGS},${IMAGE}:unstable"
           fi
 
-          # Combine all tags
-          ALL_TAGS="${DOCKERHUB_TAGS},${GHCR_TAGS}"
-
-          echo "tags=${ALL_TAGS}" >> $GITHUB_OUTPUT
-          echo "Generated tags: ${ALL_TAGS}"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Generated tags: ${TAGS}"
       -
         name: Build and push
         uses: docker/build-push-action@v6

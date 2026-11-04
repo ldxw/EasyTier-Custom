@@ -1,0 +1,128 @@
+name: EasyTier Docker Artifacts
+
+# 为 .github/workflows/docker.yml 提供五个平台的 musl 静态二进制。
+#
+# 产物形态与上游 EasyTier/EasyTier 的 Core Action 一致：artifact 名就是目录名，
+# 内容是无包装的裸文件，下载后直接构成 docker 构建上下文：
+#   easytier-linux-{x86_64,armhf,armv7hf,aarch64,riscv64}/{easytier-core,easytier-cli}
+# 因此 docker.yml 里的 Dockerfile 可以原样按 TARGETPLATFORM 取目录。
+#
+# alpine 运行时是 musl，所以必须编 *-musl 目标；gnu 产物放进去跑不起来。
+# allocator 与上游 core.yml 一致：aarch64/riscv64 用 mimalloc，其余用 jemalloc
+# （jemalloc 的 C 源在 arm/riscv64 上交叉编译不可靠）。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  artifacts:
+    name: Linux (${{ matrix.arch }})
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            features: jemalloc
+          - target: arm-unknown-linux-musleabihf
+            arch: armhf
+            features: jemalloc
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7hf
+            features: jemalloc
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            features: mimalloc
+          - target: riscv64gc-unknown-linux-musl
+            arch: riscv64
+            features: mimalloc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # git_version! 在编译期调用 git describe。没有 exact tag 时打一个本地
+      # annotated tag，让二进制 --version 落到 *-custom-dev，而不是一串 sha。
+      # 只在工作区生效，不推送。
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "Building for tag ${GITHUB_REF_NAME}"
+          elif git describe --tags --exact-match >/dev/null 2>&1; then
+            echo "Building at exact tag $(git describe --tags --exact-match)"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                tag -f -a dev -m "dev build" HEAD
+            echo "No exact tag; tagged HEAD as dev"
+          fi
+          echo "git describe: $(git describe --tags --abbrev=8 --always --dirty=~)"
+
+      # 与 build.yml 的 core job 用同一套环境准备（build-essential/mold/musl-tools、
+      # protoc 35.1、Rust 1.95），避免版本漂移。
+      - uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ matrix.target }}
+          token: ${{ github.token }}
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: true
+
+      # 上游 build.yml 锁 0.23.2；0.24.0 在 arm musl 目标的链接阶段会失败。
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docker-artifacts-${{ matrix.target }}
+
+      - name: Build binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+
+          cargo zigbuild --locked --release --target "$TARGET" -p easytier \
+            --features "$FEATURES" --bin easytier-core --bin easytier-cli
+
+          mkdir -p "easytier-linux-${ARCH}"
+          cp "target/${TARGET}/release/easytier-core" \
+             "target/${TARGET}/release/easytier-cli" \
+             "easytier-linux-${ARCH}/"
+          chmod 755 easytier-linux-"${ARCH}"/*
+          file easytier-linux-"${ARCH}"/easytier-core
+
+      # 上传的是目录里的内容而不是目录本身：artifact 名会成为下载后的目录名，
+      # 于是得到 docker_context/easytier-linux-<arch>/{easytier-core,easytier-cli}，
+      # 与 .github/workflows/Dockerfile 里的 cp 路径一一对应。多上传一层目录
+      # 会让 Dockerfile 的 cp 找不到文件。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: easytier-linux-${{ matrix.arch }}
+          path: easytier-linux-${{ matrix.arch }}/*
+          retention-days: 7
+          if-no-files-found: error

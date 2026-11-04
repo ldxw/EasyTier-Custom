@@ -11,7 +11,8 @@ Two automatic workflows keep testing separate from product compilation:
 | **EasyTier CI** (`checks.yml`) | Push to `main`/`develop`, PR targeting either branch, or manual: relevant checks and tests |
 | **EasyTier Build** (`build.yml`) | Push to `main` or manual: Release binaries, installers, Web assets and artifact cleanup |
 
-**EasyTier Release** and **EasyTier Docker** remain manual entry points. Draft
+**EasyTier Release**, **EasyTier Docker Artifacts** and **EasyTier Docker** remain
+manual entry points. Draft
 PRs skip expensive checks. Unrelated PR/develop changes skip unrelated checks;
 Go, JavaScript Hosts and Nix retain their own path filters. Each automatic
 workflow cancels its older runs for the same branch/PR independently.
@@ -109,8 +110,14 @@ downloads only those files, adds combined commit/checksums and creates a draft
 at the build commit. It does no compilation or automatic publication. Choose a
 build whose artifacts have not been cleaned up or expired.
 
-Docker retains the existing manual upstream-image flow: its run ID refers to
-Core artifacts in `EasyTier/EasyTier`, with the existing actor/registry settings.
+Docker is split in two manual stages, mirroring upstream. **EasyTier Docker
+Artifacts** (`docker-artifacts.yml`) cross-compiles five musl targets
+(`x86_64`, `armhf`, `armv7hf`, `aarch64`, `riscv64`) and uploads one artifact per
+architecture, named `easytier-linux-<arch>` with the bare binaries inside.
+**EasyTier Docker** (`docker.yml`) takes that run ID, downloads the artifacts
+from this repository only, and pushes `ghcr.io/ldxw/easytier-custom`. The image
+workflow does no compilation and never reads artifacts from `EasyTier/EasyTier`;
+Docker Hub publishing stays commented out.
 
 ## Local verification
 
