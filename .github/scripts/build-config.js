@@ -1,18 +1,26 @@
 // One source of truth for build matrices and release artifact validation.
+// `release` targets produce the downloadable product archives; `dockerArch` targets
+// additionally upload bare musl binaries consumed by docker.yml. x86_64-linux is both.
 const coreTargets = [
-  ['x86_64-unknown-linux-musl', 'ubuntu-24.04', 'linux-x86_64'],
-  ['x86_64-apple-darwin', 'macos-15-intel', 'macos-x86_64'],
-  ['x86_64-pc-windows-msvc', 'windows-latest', 'windows-x86_64'],
-].map(([target, os, name]) => ({
-  target, os, name,
-  features: target.includes('windows') ? 'mimalloc' : 'jemalloc',
+  ['x86_64-unknown-linux-musl', 'ubuntu-24.04', 'linux-x86_64', 'x86_64', true],
+  ['x86_64-apple-darwin', 'macos-15-intel', 'macos-x86_64', '', true],
+  ['x86_64-pc-windows-msvc', 'windows-latest', 'windows-x86_64', '', true],
+  ['arm-unknown-linux-musleabihf', 'ubuntu-24.04', 'linux-armhf', 'armhf', false],
+  ['armv7-unknown-linux-musleabihf', 'ubuntu-24.04', 'linux-armv7hf', 'armv7hf', false],
+  ['aarch64-unknown-linux-musl', 'ubuntu-24.04', 'linux-aarch64', 'aarch64', false],
+  ['riscv64gc-unknown-linux-musl', 'ubuntu-24.04', 'linux-riscv64', 'riscv64', false],
+].map(([target, os, name, dockerArch, release]) => ({
+  target, os, name, dockerArch, release,
+  // jemalloc's C sources do not cross-compile reliably for arm/riscv64.
+  features: /windows|aarch64|riscv64/.test(target) ? 'mimalloc' : 'jemalloc',
 }));
 
 const guiTargets = coreTargets
   .filter(({ target }) => /windows|darwin/.test(target))
   .map(({ target, os, name }) => ({ target, os, name }));
 const androidArchs = ['aarch64'];
-const checkTargets = coreTargets;
+// PR checks stay on the three shipped x86-64 targets instead of every Docker target.
+const checkTargets = coreTargets.filter(({ release }) => release);
 
 const infrastructure = /^(\.github\/(workflows\/|tauri-ci\.json$|actions\/|scripts\/)|package\.json$)/;
 const rustPaths = /^(Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.cargo\/|\.config\/nextest\.toml$|easytier\/|easytier-core\/|easytier-proto\/|easytier-rpc-build\/|easytier-web\/|easytier-gui\/|tauri-plugin-vpnservice\/|easytier-contrib\/)/;

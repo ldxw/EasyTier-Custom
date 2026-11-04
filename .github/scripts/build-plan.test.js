@@ -1,19 +1,30 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { coreTargets, guiTargets, androidArchs, buildPlan } = require('./build-config.js');
+const { coreTargets, guiTargets, androidArchs, checkTargets, buildPlan } = require('./build-config.js');
 const prepare = require('./prepare-build.js');
 const { expectedJobs, checkResults } = require('./check-build-results.js');
 
-test('PC builds only Linux/macOS/Windows x86-64; Android builds ARM64 only', () => {
-  assert.equal(coreTargets.length, 3);
+test('release builds ship three x86-64 products; Docker adds four musl targets; Android is ARM64', () => {
+  assert.equal(coreTargets.length, 7);
   assert.equal(guiTargets.length, 2);
-  assert.equal(new Set(coreTargets.map(t => t.target)).size, 3);
+  assert.equal(new Set(coreTargets.map(t => t.target)).size, 7);
   assert.equal(new Set(guiTargets.map(t => t.target)).size, 2);
   assert.deepEqual(androidArchs, ['aarch64']);
   assert.deepEqual(guiTargets.map(t => t.name).sort(), [
     'macos-x86_64', 'windows-x86_64',
   ]);
-  assert.ok([...coreTargets, ...guiTargets].every(t => t.target.startsWith('x86_64-')));
+  // Docker binaries run in musl-based Alpine images, so every extra target is a
+  // static musl build; the release subset stays on the three shipped x86-64 hosts.
+  const dockerTargets = coreTargets.filter(t => t.dockerArch !== '');
+  assert.deepEqual(dockerTargets.map(t => t.target).filter(t => !t.startsWith('x86_64-')).sort(), [
+    'aarch64-unknown-linux-musl', 'arm-unknown-linux-musleabihf',
+    'armv7-unknown-linux-musleabihf', 'riscv64gc-unknown-linux-musl',
+  ]);
+  assert.deepEqual(dockerTargets.map(t => t.dockerArch).sort(), [
+    'aarch64', 'armhf', 'armv7hf', 'riscv64', 'x86_64',
+  ]);
+  assert.ok(coreTargets.filter(t => t.release).every(t => t.target.startsWith('x86_64-')));
+  assert.deepEqual(checkTargets.map(t => t.target), coreTargets.filter(t => t.release).map(t => t.target));
   assert.ok([...coreTargets, ...guiTargets].every(t => !/freebsd|ohos|magisk/.test(t.target)));
   assert.equal(coreTargets.find(t => t.name === 'macos-x86_64').os, 'macos-15-intel');
 });

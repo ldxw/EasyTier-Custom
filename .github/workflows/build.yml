@@ -105,20 +105,49 @@ jobs:
       FEATURES: ${{ matrix.features }}
       ARTIFACT_NAME: easytier-${{ matrix.name }}
     steps:
+      # git_version! runs git describe at compile time; tags are required for the
+      # Docker binaries to report a tag-based version instead of a bare sha.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # Without an exact tag, tag HEAD locally so the version becomes *-custom-dev.
+      # The tag is never pushed.
+      - name: Resolve version
+        if: matrix.dockerArch != ''
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "Building for tag ${GITHUB_REF_NAME}"
+          elif git describe --tags --exact-match >/dev/null 2>&1; then
+            echo "Building at exact tag $(git describe --tags --exact-match)"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                tag -f -a dev -m "dev build" HEAD
+            echo "No exact tag; tagged HEAD as dev"
+          fi
+          echo "git describe: $(git describe --tags --abbrev=8 --always --dirty=~)"
       - uses: ./.github/actions/prepare-build
         with:
           target: ${{ matrix.target }}
           token: ${{ github.token }}
+      # Only release targets consume the frontend assets (build-core.sh asserts them,
+      # the smoke test runs the embedded Web). Docker-only targets compile two bare
+      # binaries and skip all three steps.
       - uses: actions/setup-node@v5
+        if: matrix.release
         with:
           node-version: 22
       - uses: ./.github/actions/shared-resources
+        if: matrix.release
         with:
           mode: restore
           name: frontend
           path: frontend-assets.tar.gz
       - run: tar -xzf frontend-assets.tar.gz
+        if: matrix.release
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: core-release-${{ matrix.target }}
@@ -132,7 +161,37 @@ jobs:
         with:
           tool: cargo-zigbuild@0.23.2
       - name: Build command-line programs
+        if: matrix.release
         run: bash .github/scripts/build-core.sh
+      # Docker-only targets skip the release script (no Web/mini) and compile just
+      # the two binaries the image needs.
+      - name: Build Docker binaries
+        if: matrix.dockerArch != '' && !matrix.release
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --release --target "$TARGET" -p easytier \
+            --features "$FEATURES" --bin easytier-core --bin easytier-cli
+      # Artifact name becomes the download directory, matching the Dockerfile's
+      # cp paths: easytier-linux-<arch>/{easytier-core,easytier-cli}.
+      - name: Stage Docker binaries
+        if: matrix.dockerArch != ''
+        run: |
+          set -euo pipefail
+          mkdir -p "easytier-linux-${{ matrix.dockerArch }}"
+          cp "target/$TARGET/release/easytier-core" \
+             "target/$TARGET/release/easytier-cli" \
+             "easytier-linux-${{ matrix.dockerArch }}/"
+          chmod 755 easytier-linux-"${{ matrix.dockerArch }}"/*
+          file easytier-linux-"${{ matrix.dockerArch }}"/*
+      # No archive: false here — multiple files need the default packaged upload,
+      # which docker.yml extracts back into per-artifact directories.
+      - uses: actions/upload-artifact@v7
+        if: matrix.dockerArch != ''
+        with:
+          name: easytier-linux-${{ matrix.dockerArch }}
+          path: easytier-linux-${{ matrix.dockerArch }}/*
+          retention-days: 7
+          if-no-files-found: error
       - name: Verify Windows runtime dependencies
         if: runner.os == 'Windows'
         shell: pwsh
@@ -175,8 +234,10 @@ jobs:
           EASYTIER_SMOKE_BIN_DIR="$PWD/artifacts" pnpm --dir easytier-web/frontend exec node --test tests/local-config-creation.test.mjs
       - name: Package binaries with checksums and Unix executable permissions
         id: package
+        if: matrix.release
         run: node .github/scripts/package-build.js "$ARTIFACT_NAME" artifacts dist "$GITHUB_SHA"
       - uses: actions/upload-artifact@v7
+        if: matrix.release
         with:
           path: ${{ steps.package.outputs.path }}
           archive: false

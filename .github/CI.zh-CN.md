@@ -11,7 +11,7 @@
 | **EasyTier CI**（`checks.yml`） | `main/develop` 推送、面向这两个分支的 PR，或手动运行：执行相关检查和测试 |
 | **EasyTier Build**（`build.yml`） | `main` 推送或手动运行：编译 Release、打包、上传及清理旧产物 |
 
-**EasyTier Release**、**EasyTier Docker Artifacts**、**EasyTier Docker** 继续作为
+**EasyTier Release**、**EasyTier Docker** 继续作为
 手动入口。草稿 PR 跳过昂贵检查；
 PR/develop 按相关路径检查，Go、JavaScript Hosts、Nix 保留独立路径过滤。
 两个自动工作流各自取消同分支或 PR 的旧运行，互不取消。
@@ -88,12 +88,13 @@ Release 附件；最新成功产物仍受七天有效期限制。
 记录和校验和，并在构建提交上创建发布草稿；不重新编译、不自动发布。需要选择
 尚未清理或过期的构建。
 
-Docker 改为与上游一致的两段式手动流程。**EasyTier Docker Artifacts**
-（`docker-artifacts.yml`）交叉编译五个 musl 目标（`x86_64`、`armhf`、`armv7hf`、
-`aarch64`、`riscv64`），每个架构上传一份 artifact，名为 `easytier-linux-<arch>`，
-内容为裸二进制。**EasyTier Docker**（`docker.yml`）填写该运行的 run ID，只从本仓库
-下载产物，推送 `ghcr.io/ldxw/easytier-custom`。镜像工作流不编译，也不再读取
-`EasyTier/EasyTier` 的产物；Docker Hub 段保持注释。
+Docker 与上游一致：编译在 **EasyTier Build** 里，镜像工作流只消费。`build.yml` 的
+core 矩阵包含五个 musl 目标（`x86_64`、`armhf`、`armv7hf`、`aarch64`、`riscv64`），
+每个目标上传一份 artifact，名为 `easytier-linux-<arch>`，内容为裸二进制
+`easytier-core` 与 `easytier-cli`。其中 `linux-x86_64` 同时是发布目标，其余四个
+只供镜像使用。**EasyTier Docker**（`docker.yml`）填写一次成功全量 build 的 run ID，
+只从本仓库下载产物，推送 `ghcr.io/ldxw/easytier-custom`。镜像工作流不编译，也不再
+读取 `EasyTier/EasyTier` 的产物；Docker Hub 段保持注释。
 
 ## 本地验证
 

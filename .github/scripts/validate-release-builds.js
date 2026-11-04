@@ -3,8 +3,9 @@ const BUILD_PATH = '.github/workflows/build.yml';
 // Keep release completeness tied to the same target list that creates the build matrix.
 function expectedArtifacts() {
   const { coreTargets, guiTargets, androidArchs } = require('./build-config.js');
+  // Docker-only matrix entries upload bare binaries, not release products.
   return [
-    ...coreTargets.map(({ target, name }) => {
+    ...coreTargets.filter(({ release }) => release).map(({ target, name }) => {
       const extension = target.includes('windows') ? '.zip' : '.tar.gz';
       return { name: `easytier-${name}${extension}`, kind: 'archive', extension };
     }),
