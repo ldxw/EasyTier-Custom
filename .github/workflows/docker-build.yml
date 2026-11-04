@@ -1,0 +1,161 @@
+name: EasyTier Docker (build from source)
+
+# 本文件是 .github/workflows/docker.yml 的副本，独立维护，不改原文件。
+#
+# 与上游 docker.yml 的差别：
+#   - 不再下载 EasyTier/EasyTier 的 artifact，改为在本仓库源码树里直接编译
+#   - 平台与原版一致：linux/amd64, linux/arm/v6, linux/arm/v7, linux/arm64, linux/riscv64
+#   - 镜像只推 GHCR
+#   - 版本号来自 git tag，无 tag 时为 dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Override image tag (empty = derive from git tag, or "dev")'
+        type: string
+        default: ''
+      mark_latest:
+        description: 'Also push the latest tag'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ldxw/easytier-custom
+
+jobs:
+  docker:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ inputs.image_tag }}" ]]; then
+            VERSION="${{ inputs.image_tag }}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          elif EXACT_TAG="$(git describe --tags --exact-match 2>/dev/null)"; then
+            VERSION="${EXACT_TAG}"
+          else
+            VERSION=dev
+          fi
+
+          # git_version! 在编译期调用 git describe。没有 exact tag 时打一个本地
+          # 轻量标记，让二进制 --version 也落到 *-custom-dev，而不是一串 sha。
+          # 只在工作区生效，不推送。
+          if [[ "$VERSION" == "dev" ]] && ! git describe --tags --exact-match >/dev/null 2>&1; then
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                tag -f -a dev -m "dev build" HEAD
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+          echo "git describe: $(git describe --tags --abbrev=8 --always --dirty=~)"
+
+      # 与 build.yml 的 core job 用同一套环境准备（build-essential/mold/musl-tools、
+      # protoc 35.1、Rust 1.95），避免两处版本漂移。
+      - uses: ./.github/actions/prepare-build
+        with:
+          target: x86_64-unknown-linux-musl,arm-unknown-linux-musleabihf,armv7-unknown-linux-musleabihf,aarch64-unknown-linux-musl,riscv64gc-unknown-linux-musl
+          token: ${{ github.token }}
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: true
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docker-source-${{ steps.version.outputs.version }}
+
+      # 第一步：在源码目录编出五个平台的 musl 静态二进制。
+      # 目录布局沿用原版 Dockerfile 期待的 easytier-linux-<arch>/，
+      # 目录名与原版 docker.yml 下载的 artifact 目录一一对应。
+      # alpine 运行时是 musl，所以必须是 *-musl 目标；gnu 产物放进去跑不起来。
+      # allocator 选择与上游 core.yml 一致：aarch64/riscv64 用 mimalloc，
+      # 其余用 jemalloc（jemalloc 的 C 源在 arm/riscv64 上交叉编译不可靠）。
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+
+          for entry in \
+            "x86_64-unknown-linux-musl x86_64 jemalloc" \
+            "arm-unknown-linux-musleabihf armhf jemalloc" \
+            "armv7-unknown-linux-musleabihf armv7hf jemalloc" \
+            "aarch64-unknown-linux-musl aarch64 mimalloc" \
+            "riscv64gc-unknown-linux-musl riscv64 mimalloc"; do
+            set -- $entry
+            target="$1"
+            arch="$2"
+            features="$3"
+            echo "::group::Build ${target} (${features})"
+            cargo zigbuild --locked --release --target "$target" -p easytier \
+              --features "$features" --bin easytier-core --bin easytier-cli
+            mkdir -p "easytier-linux-${arch}"
+            cp "target/${target}/release/easytier-core" \
+               "target/${target}/release/easytier-cli" \
+               "easytier-linux-${arch}/"
+            echo "::endgroup::"
+          done
+
+          chmod 755 easytier-linux-*/*
+          file easytier-linux-*/easytier-core
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare Docker tags
+        id: tags
+        run: |
+          set -euo pipefail
+          TAGS="${IMAGE}:${{ steps.version.outputs.version }}"
+
+          if [[ "${{ inputs.mark_latest }}" == "true" ]]; then
+            TAGS="${TAGS},${IMAGE}:latest"
+          fi
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Generated tags: ${TAGS}"
+
+      # 第二步：把上一步的产物打进镜像，buildx 按 TARGETARCH 各取一份。
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/workflows/Dockerfile.build
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}

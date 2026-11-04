@@ -1,0 +1,6 @@
+# docker-build.yml 的 context 是仓库根目录，而 Dockerfile.build 只用到上一步
+# 产出的五个 easytier-linux-<arch>/ 目录。先全排掉，再把它们放回来，避免把整个
+# 源码树和 target/ 传进 daemon。
+*
+!easytier-linux-*
+!easytier-linux-*/**
