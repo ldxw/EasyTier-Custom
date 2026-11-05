@@ -2,6 +2,20 @@
 
 各轮合入与专项改动的验证范围、结果和未通过项，按时间倒序排列。改动说明见 [CUSTOM_CHANGES.md](CUSTOM_CHANGES.md)。
 
+## 官方主线合入验证（2026-11-04）
+
+本轮把官方基线从 `48ccc56a` 推进到 `759a270b`，合入 9 个官方提交：版本串追加 UTC 提交日期（#2797）、three_node 端口转发 ACL 测试的可用目的地门控（#2795）、relay failover 早于空 peer 清理（#2781）、Windows 旧版重启恢复（#2780）、Windows TUN 名称分配的注册表缺失值（#2777）、UDP 对称打洞 socket 交接与重试（#2774）、Windows 重启保持 Wintun 身份（#2773）、Web `tld_dns_zone` 端到端（#2425）、未测量连接不报 1ms（#2768）。
+
+合并冲突两处：`connectivity/hole_punch/udp/client.rs` 的 `MockRuntime::connect_with_socket` 在上游为两参、本库为三参，补 `UdpPunchScheme::Udp`；`config/api_input.rs` 的 `tld_dns_zone` 测试已存在于本库 HEAD，合并后出现重复定义，恢复为 HEAD 原样。`tun-easytier` 的 rev 由 #2773/#2780 抬到 `43621f70`，属官方正常升级，保留。
+
+本轮实际验证（Linux 沙箱，`cargo 1.95.0`，与 `rust-toolchain.toml` 一致）：
+
+- `cargo check --locked -p easytier --features full --lib --bins` 通过。
+- 定向测试：`peers::conn::` 86 项、`config::api_input` 25 项、`easytier-web` 408 项（2 项默认忽略）全部通过，无失败。
+- CI 脚本单测 64 项通过；`actionlint` 对全部工作流无告警。
+- 未运行：`cargo fmt --check`（本机与沙箱的 1.95 工具链均未安装 rustfmt）、严格 Clippy、`--all-targets` 完整构建。`--all-targets` 当前被 `easytier/tests/config_logging.rs` 的 `env!("CARGO_BIN_EXE_easytier-core")` 编译期未定义阻断，该写法与上游同源，且 `easytier-core` bin 在本库声明了 `test = false`，属既有状况而非本轮引入；CI 通过 `cargo nextest archive` + `nextest run --archive-file` 注入 `NEXTEST_BIN_EXE_easytier_core` 覆盖这部分代码。
+- 未运行：`connectivity::hole_punch::udp` 的定向测试，`client.rs`/`server.rs`/`socket_array.rs` 三处改动本轮只经编译验证；该路径的测试属 `easytier-core` 包，需用 `-p easytier-core` 运行。
+
 ## 兼容层清理与并行传输改进验证（2026-10-27）
 
 在 Windows 本机运行，覆盖 P2P 伪装策略合并、并行发送计划、调度与重排、送达速率带宽估计和地球服务端汇总。

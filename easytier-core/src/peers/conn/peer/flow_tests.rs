@@ -63,6 +63,24 @@ fn new_peer() -> Peer {
 }
 
 #[tokio::test]
+async fn cached_live_connection_does_not_scan_connection_map() {
+    let peer = Arc::new(new_peer());
+    assert!(!peer.has_live_conns());
+    let (sender, _receiver) = create_packet_recv_chan();
+    let (conn_id, _server) = add_connection(&peer, sender, Some(1_000)).await;
+    assert!(peer.has_live_conns());
+    peer.select_conn().unwrap();
+
+    // Cached availability must not wait for the connection map's shard lock.
+    let conn_guard = peer.conns.get_mut(&conn_id).unwrap();
+    let check_peer = peer.clone();
+    let check = tokio::task::spawn_blocking(move || check_peer.has_live_conns());
+    let result = crate::foundation::time::timeout(Duration::from_secs(1), check).await;
+    drop(conn_guard);
+    assert!(result.unwrap().unwrap());
+}
+
+#[tokio::test]
 async fn send_failure_marks_connection_closed_without_waiting_for_ping() {
     let (left, right) = create_ring_tunnel_pair();
     let (stream, _sink) = right.split();

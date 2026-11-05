@@ -1064,6 +1064,14 @@ impl Peer {
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
+        match self.try_send_msg(msg).await? {
+            None => Ok(()),
+            Some(_) => Err(Error::PeerNoConnectionError(self.peer_node_id)),
+        }
+    }
+
+    /// Returns the unsent packet only when no usable connection can be selected.
+    pub(crate) async fn try_send_msg(&self, msg: ZCPacket) -> Result<Option<ZCPacket>, Error> {
         if crate::peers::traffic_metrics::data_packet_payload_len(&msg).is_some() {
             self.data_active.store(true, Ordering::Relaxed);
         }
@@ -1091,31 +1099,35 @@ impl Peer {
             }
             // Striping orders every packet on the receiver, so flows need no
             // connection binding while it runs.
+            // Striping consumes the packet into the parallel envelope, so a
+            // failure cannot hand it back for the relay failover to retry;
+            // the error propagates as with any other unusable connection.
             if plan.stripe {
-                return self.send_striped(msg, &plan).await;
+                return self.send_striped(msg, &plan).await.map(|()| None);
             }
         }
         if let Some(key) = msg.flow_key {
-            let conn = self
-                .select_flow_conn(key)
-                .ok_or(Error::PeerNoConnectionError(self.peer_node_id))?;
-            return conn.send_msg(msg).await;
+            let Some(conn) = self.select_flow_conn(key) else {
+                return Ok(Some(msg));
+            };
+            conn.send_msg(msg).await?;
+            return Ok(None);
         }
         let default_conn = self.default_conn.load();
         if let Some(conn) = default_conn.as_ref()
             && !conn.is_closed()
         {
             conn.send_msg(msg).await?;
-            return Ok(());
+            return Ok(None);
         }
         drop(default_conn);
 
         let Some(conn) = self.select_conn() else {
-            return Err(Error::PeerNoConnectionError(self.peer_node_id));
+            return Ok(Some(msg));
         };
         conn.send_msg(msg).await?;
 
-        Ok(())
+        Ok(None)
     }
 
     /// Sends on the member expected to deliver the packet first, from its
@@ -1232,6 +1244,14 @@ impl Peer {
     }
 
     pub fn has_live_conns(&self) -> bool {
+        if self
+            .default_conn
+            .load()
+            .as_ref()
+            .is_some_and(|conn| !conn.is_closed())
+        {
+            return true;
+        }
         self.conns.iter().any(|entry| !entry.value().is_closed())
     }
 

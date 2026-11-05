@@ -6,7 +6,7 @@
 
 - 上游仓库：https://github.com/EasyTier/EasyTier
 - 本项目仓库：https://github.com/ldxw/EasyTier-Custom
-- 最近已合入的上游基线：`48ccc56a1aa4a63ec5192f71e85b330b155f0136`（2026-10-27 的上游提交，2026-10-28 由 `f7d12596` 合入）。
+- 最近已合入的上游基线：`759a270b152b8c85daa2a26dd243b4db0d80b86b`（2026-11-04 的上游提交）。
 - 开源协议与该上游版本一致：GNU Lesser General Public License v3.0（LGPL-3.0），见根目录 [LICENSE](../LICENSE)。保留上游历史、作者归属及第三方组件各自的许可证；本项目修改按同一项目许可证发布。
 - 本文对比上述固定基线，不把“尚未合入上游后续提交”当作本项目主动删除的功能。
 
@@ -159,9 +159,9 @@
 本项目的构建、测试和发布流程与上游不共用同一套工作流。上游在 `.github/workflows/` 下放了十三个工作流（加一个 `Dockerfile`），用 `core.yml`/`gui.yml`/`mobile.yml`/`test.yml`/`nightly*.yml` 等覆盖全平台矩阵、定时构建与自动发布；本仓库换成了按需精简的自有价值链，`.github/workflows/` 下只有六个文件（`Dockerfile`、`build.yml`、`checks.yml`、`docker.yml`、`go-artifacts.yml`、`release.yml`）。
 
 - **自研入口**：`build.yml` 负责发布编译、打包、上传与旧产物清理；`checks.yml` 负责测试与静态检查；`go-artifacts.yml` 在 `main` 推送后按路径变化重新生成 `easytier-go` 的内嵌 WASI 核心和 protobuf 绑定并回推提交（上游对应的 `go.yml` 只是测试）。`docker.yml` 和 `release.yml` 沿用上游的“手动指定一次成功 build 的 run ID”模式，但只消费本仓库自己的产物。
-- **自研脚本与复合 action**：`scripts/build-config.js`（编译矩阵与产物清单的单一来源）、`prepare-build.js`、`build-plan.test.js`、`build-core.sh`、`package-build.js`、`check-build-results.js`、`clear-shared-caches.js`、`prune-build-artifacts.cjs`、`copy-windows-drivers.sh`、`verify-windows-runtime.ps1` 及对应单测，加上 `actions/shared-resources/action.yml` 与 `.github/tauri-ci.json`，上游都没有。
-- **删除的上游文件**：`workflows/` 下的 `core.yml`、`gui.yml`、`test.yml`、`go.yml`、`js.yml`、`nix.yml`、`mobile.yml`、`ohos.yml`、`nightly.yml`、`nightly-retry.yml`、`nightly-release.yml`，以及 `scripts/` 下的 `nightly-build.js`、`nightly-release.js`、`nightly-release.test.js`。其中 `core.yml` 依赖被一并删除的 nightly 脚本，原样复制进来会直接失败。
-- **同名但已改写的文件**：`CI.md`、`CI.zh-CN.md`、`docker.yml`、`release.yml`、`scripts/builds.test.js`、`scripts/validate-release-builds.js`、`actions/prepare-build/action.yml`、`actions/prepare-pnpm/action.yml`。这些文件的结构来自上游，内容已按本仓库的矩阵与产物约定重写。
+- **自研脚本与复合 action**：`.github/scripts/` 下的 `build-config.js`（编译矩阵与产物清单的单一来源）、`prepare-build.js`、`build-plan.test.js`、`build-core.sh`、`package-build.js`、`check-build-results.js`、`clear-shared-caches.js`、`prune-build-artifacts.cjs`、`copy-windows-drivers.sh`、`verify-windows-runtime.ps1` 及对应单测，加上 `.github/actions/shared-resources/action.yml` 与 `.github/tauri-ci.json`，上游都没有。
+- **删除的上游文件**：`.github/workflows/` 下的 `core.yml`、`gui.yml`、`test.yml`、`go.yml`、`js.yml`、`nix.yml`、`mobile.yml`、`ohos.yml`、`nightly.yml`、`nightly-retry.yml`、`nightly-release.yml`，以及 `.github/scripts/` 下的 `nightly-build.js`、`nightly-release.js`、`nightly-release.test.js`。其中 `core.yml` 依赖被一并删除的 nightly 脚本，原样复制进来会直接失败。
+- **同名但已改写的文件**：`.github/CI.md`、`.github/CI.zh-CN.md`、`.github/workflows/docker.yml`、`.github/workflows/release.yml`、`.github/scripts/builds.test.js`、`.github/scripts/validate-release-builds.js`、`.github/actions/prepare-build/action.yml`、`.github/actions/prepare-pnpm/action.yml`。这些文件的结构来自上游，内容已按本仓库的矩阵与产物约定重写。
 - **Docker 原料**：五个 musl 目标（`x86_64`、`armhf`、`armv7hf`、`aarch64`、`riscv64`）由 `build.yml` 的 core 矩阵编译并作为 artifact 上传，`docker.yml` 只下载与打包，不编译任何代码。其中 `x86_64` 同时是发布目标，另外四个只供镜像使用。
 
 同步上游时注意以下几点：
@@ -216,8 +216,8 @@ cargo build --release --locked -p easytier
 Git 历史保留了上游提交与本项目提交。克隆后可查看完整差异与变更记录：
 
 ```sh
-git diff 48ccc56a1aa4a63ec5192f71e85b330b155f0136 HEAD
-git log --oneline 48ccc56a1aa4a63ec5192f71e85b330b155f0136..HEAD
+git diff 759a270b152b8c85daa2a26dd243b4db0d80b86b HEAD
+git log --oneline 759a270b152b8c85daa2a26dd243b4db0d80b86b..HEAD
 ```
 
 这里的基线是最近一次已合入的上游提交；上游继续前进后，两者之间会多出尚未合入的上游提交，需要先同步再对比。
