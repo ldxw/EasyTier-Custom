@@ -145,36 +145,132 @@ jobs:
           ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
         run: |
           set -euo pipefail
-          tags=""
-          append_tags() {
+
+          # 单个镜像的标签串：基础 tag + 可选的 latest / unstable
+          image_tags() {
             local image="$1"
-            tags="${tags:+$tags,}${image}:${IMAGE_TAG}"
+            local out="${image}:${IMAGE_TAG}"
             if [[ "$MARK_LATEST" == "true" ]]; then
-              tags="${tags},${image}:latest"
+              out="${out},${image}:latest"
             fi
             if [[ "$MARK_UNSTABLE" == "true" ]]; then
-              tags="${tags},${image}:unstable"
+              out="${out},${image}:unstable"
             fi
+            printf '%s' "$out"
           }
 
+          # 把若干标签段拼成 build-push-action 需要的逗号列表
+          join_tags() {
+            local sep="" t
+            for t in "$@"; do
+              [[ -z "$t" ]] && continue
+              printf '%s%s' "$sep" "$t"
+              sep=","
+            done
+          }
+
+          attested=()
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/easytier-custom"
+          hub_image="${DOCKERHUB_USERNAME,,}/easytier-custom"
+          acr_image="${ACR_REGISTRY}/${ACR_NAMESPACE}/easytier-custom"
+
+          # mirror_repo 是"已带 attestation 的那份镜像"所在仓库，供 ACR 拷贝时读取
+          mirror_repo=""
           if [[ "$PUSH_GHCR" == "true" ]]; then
-            append_tags "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/easytier-custom"
+            attested+=("$(image_tags "$ghcr_image")")
+            mirror_repo="$ghcr_image"
           fi
           if [[ "$PUSH_DOCKERHUB" == "true" ]]; then
-            append_tags "${DOCKERHUB_USERNAME,,}/easytier-custom"
+            attested+=("$(image_tags "$hub_image")")
+            if [[ -z "$mirror_repo" ]]; then
+              mirror_repo="$hub_image"
+            fi
           fi
+
+          ACR_TAGS=""
           if [[ "$PUSH_ACR" == "true" ]]; then
-            append_tags "${ACR_REGISTRY}/${ACR_NAMESPACE}/easytier-custom"
+            ACR_TAGS="$(image_tags "$acr_image")"
           fi
 
-          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "Generated tags: ${tags}"
+          echo "attested_tags=$(join_tags ${attested[@]+"${attested[@]}"})" >> "$GITHUB_OUTPUT"
+          echo "acr_tags=${ACR_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "mirror_repo=${mirror_repo}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "GHCR / Docker Hub tags: $(join_tags ${attested[@]+"${attested[@]}"})"
+          echo "Aliyun ACR tags: ${ACR_TAGS:-<none>}"
+          echo "ACR mirror source: ${mirror_repo:-<none>}"
 
-      - name: Build and push
+      # 一次构建产物：GHCR / Docker Hub 认识 OCI attestation manifest，
+      # 保留 buildx 默认的 provenance + SBOM，镜像附带来源证明
+      - name: Build and push (GHCR / Docker Hub)
+        if: ${{ inputs.push_ghcr || inputs.push_dockerhub }}
         uses: docker/build-push-action@v6
         with:
           context: ./docker_context
           platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
           push: true
+          provenance: true
+          sbom: true
           file: .github/workflows/Dockerfile
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags.outputs.attested_tags }}
+
+      # 只勾了阿里云时没有可镜像的源，直接构建并在构建阶段就关掉 attestation
+      - name: Build and push (Aliyun ACR only)
+        if: ${{ inputs.push_acr && !(inputs.push_ghcr || inputs.push_dockerhub) }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker_context
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+          push: true
+          provenance: false
+          sbom: false
+          file: .github/workflows/Dockerfile
+          tags: ${{ steps.tags.outputs.acr_tags }}
+
+      # 阿里云 ACR 不认 application/vnd.oci.empty.v1+json 这类 attestation manifest，
+      # 会以 "unknown manifest class" 拒绝整个 push。这里不重建镜像，
+      # 而是从已推好的 index 里挑出 5 个真实平台条目，拼成一个不含 attestation 的
+      # 干净 index 推到 ACR——层数据由 buildx 从源仓库直接复制，不经过二次构建。
+      - name: Mirror to Aliyun ACR (strip attestation)
+        if: ${{ inputs.push_acr && (inputs.push_ghcr || inputs.push_dockerhub) }}
+        env:
+          MIRROR_REPO: ${{ steps.tags.outputs.mirror_repo }}
+          IMAGE_TAG: ${{ steps.tags.outputs.image_tag }}
+          ACR_TAGS: ${{ steps.tags.outputs.acr_tags }}
+        run: |
+          set -euo pipefail
+
+          source_ref="${MIRROR_REPO}:${IMAGE_TAG}"
+          echo "镜像源: ${source_ref}"
+
+          # 只取真实平台条目，丢掉 unknown/unknown 的 attestation manifest
+          raw="$(docker buildx imagetools inspect --raw "$source_ref")"
+          mapfile -t digests < <(
+            printf '%s' "$raw" \
+              | python3 -c 'import json,sys;idx=json.load(sys.stdin);print("\n".join(m["digest"] for m in idx.get("manifests",[]) if (m.get("platform") or {}).get("os")=="linux"))' \
+              | grep -v '^$' || true
+          )
+
+          if [[ "${#digests[@]}" -ne 5 ]]; then
+            echo "::error::从 ${source_ref} 只筛出 ${#digests[@]} 个平台条目，预期 5 个"
+            printf '%s\n' "$raw"
+            exit 1
+          fi
+
+          for d in "${digests[@]}"; do
+            echo "  平台条目 ${d}"
+          done
+
+          sources=()
+          for d in "${digests[@]}"; do
+            sources+=("${MIRROR_REPO}@${d}")
+          done
+
+          tag_args=()
+          IFS=',' read -ra tag_list <<< "$ACR_TAGS"
+          for t in "${tag_list[@]}"; do
+            tag_args+=(-t "$t")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          echo "已推送到阿里云 ACR：${ACR_TAGS}"
