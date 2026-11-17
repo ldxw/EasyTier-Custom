@@ -134,8 +134,10 @@ export interface NodePeerConn {
     conn_id: string;
     tunnel?: { tunnel_type?: string, local_addr?: any, remote_addr?: any } | null;
     stats?: { latency_us?: number | string, rx_bytes?: number | string, tx_bytes?: number | string,
-        estimated_rx_bps?: number | string, estimated_tx_bps?: number | string, bandwidth_estimate_version?: number | string } | null;
+        estimated_rx_bps?: number | string, estimated_tx_bps?: number | string, bandwidth_estimate_version?: number | string,
+        current_rx_bps?: number | string, current_tx_bps?: number | string } | null;
     loss_rate?: number;
+    link_loss_rate?: number | string;
     is_closed?: boolean;
 }
 
@@ -219,7 +221,7 @@ export interface MeshMember {
     pending: boolean;
     sync_at?: number | null;
     credential: boolean;
-    /** Batch edits from this console leave its advanced settings and running state alone. */
+    /** Batch edits from this console leave its advanced settings and access control alone. */
     locked?: boolean;
     /** The advanced settings it held when last seen. */
     advanced?: MeshAdvancedValues;
@@ -255,9 +257,11 @@ export interface MeshAclProtocolTarget {
 export type MeshAclPeer =
     | { type: 'all' }
     | { type: 'group'; name: string }
-    | { type: 'device'; instance_id: string };
+    | { type: 'device'; instance_id: string }
+    /** A source address, for clients this console does not manage. */
+    | { type: 'address'; cidr: string };
 
-export type MeshAclTarget = MeshAclPeer | { type: 'subnet'; cidrs: string[] };
+export type MeshAclTarget = Exclude<MeshAclPeer, { type: 'address' }> | { type: 'subnet'; cidrs: string[] };
 
 export interface MeshAclRule {
     id: string;
@@ -819,22 +823,6 @@ class WebRemoteClient implements Api.RemoteClient {
         const response = await this.client.get<any, Api.CollectNetworkInfoResponse>('/machines/' + this.machine_id + '/networks/info/' + inst_id);
         return response.info?.map?.[inst_id];
     }
-    async get_vpn_status(inst_id: string): Promise<NetworkTypes.GetVpnStatusResponse | undefined> {
-        const response = await this.client.post<any, NetworkTypes.GetVpnStatusResponse>(
-            `/machines/${this.machine_id}/proxy-rpc`,
-            {
-                service_name: 'api.instance.PeerManageRpcService',
-                method_name: 'get_vpn_status',
-                payload: {
-                    instance: {
-                        id: Utils.StrToUuid(inst_id),
-                    },
-                },
-            },
-        );
-        return NetworkTypes.normalizeVpnStatus(response);
-    }
-
     async get_vpn_portal_info(inst_id: string): Promise<NetworkTypes.VpnPortalInfo | undefined> {
         const response = await this.client.post<any, { vpn_portal_info?: NetworkTypes.VpnPortalInfo }>(
             `/machines/${this.machine_id}/proxy-rpc`,

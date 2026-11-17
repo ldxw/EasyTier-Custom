@@ -3,7 +3,9 @@ mod central_local_delivery_tests;
 #[cfg(test)]
 mod listener_tests;
 mod local_configs;
+mod location;
 mod managed_config;
+mod mutation_guard;
 pub mod network_info_cache;
 mod runtime_reconcile;
 pub mod session;
@@ -20,22 +22,25 @@ use std::{
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use easytier::common::config::{ConfigSource, config_source_from_rpc, config_source_to_rpc};
+use easytier::common::config::ConfigSource;
 use easytier::proto::{
-    api::config::ConfigRpc,
-    api::manage::{
-        CollectNetworkInfoRequest, CollectNetworkInfoResponse, DeleteNetworkInstanceRequest,
-        DeleteNetworkInstanceResponse, GetNetworkInstanceConfigRequest, ListNetworkInstanceRequest,
-        MyNodeInfo, RemoveNetworkInstanceConfigRequest, RunNetworkInstanceRequest,
-        SaveNetworkInstanceConfigRequest, SetNetworkInstanceEnabledRequest, WebClientService,
+    api::{
+        config::ConfigRpc,
+        manage::{
+            CollectNetworkInfoResponse, DeleteNetworkInstanceResponse,
+            GetNetworkInstanceConfigRequest, NetworkConfig, WebClientService,
+        },
     },
     rpc_types::controller::BaseController,
     web::{HeartbeatRequest, HeartbeatResponse},
 };
 use easytier_core::{
-    management::remote_client::{
-        self, ListNetworkInstanceIdsJsonResp, RemoteClientError, RemoteClientManager,
-        Storage as RemoteStorage,
+    management::{
+        config_source_from_rpc,
+        remote_client::{
+            self, ListNetworkInstanceIdsJsonResp, PersistentConfig as _, RemoteClientError,
+            RemoteClientManager, Storage as _,
+        },
     },
     socket::SocketListener,
     tunnel::{Tunnel, web_security},
@@ -43,10 +48,9 @@ use easytier_core::{
 use maxminddb::geoip2;
 use session::{Location, ManagedConfigPersistedChange, Session};
 use storage::{Storage, StorageToken};
-use uuid::Uuid;
 
 use crate::FeatureFlags;
-use crate::geolocation::{CityGeoCache, node_public_ips};
+use crate::geolocation::CityGeoCache;
 use crate::webhook::{ManagedNetworkConfig, SharedWebhookConfig};
 use tokio::task::JoinSet;
 
@@ -206,88 +210,6 @@ impl ClientManager {
             network_info_cache: Default::default(),
             heartbeat_policy,
         }
-    }
-
-    pub fn network_info_cache(&self) -> &network_info_cache::NetworkInfoCache {
-        &self.network_info_cache
-    }
-
-    pub fn set_city_geo_cache(&mut self, cache: Arc<CityGeoCache>) {
-        tracing::info!(
-            online = cache.online_enabled(),
-            "city geolocation enabled; online mode sends only mesh-reported public IPs to GeoJS/IPWho.is"
-        );
-        self.city_geo_cache = Some(cache.clone());
-        self.tasks.spawn(cache.clone().run());
-        let sessions = self.client_sessions.clone();
-        let slots = self.network_location_refresh_slots.clone();
-        let offline_db = self.geoip_db.clone();
-        self.tasks.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let connected: Vec<_> = sessions
-                    .iter()
-                    .map(|session| session.value().clone())
-                    .collect();
-                let mut jobs = JoinSet::new();
-                for session in connected {
-                    if !session.is_running() {
-                        continue;
-                    }
-                    let active_ips = {
-                        let data = session.data();
-                        let mut data = data.write().await;
-                        if !data.has_running_network() {
-                            data.clear_network_location();
-                            continue;
-                        }
-                        data.verified_network_location_ips(std::time::Instant::now())
-                            .map(|ips| ips.to_vec())
-                            .unwrap_or_default()
-                    };
-                    for ip in active_ips {
-                        cache.observe(ip).await;
-                    }
-                    if jobs.len() >= 4 {
-                        let _ = jobs.join_next().await;
-                    }
-                    let cache = cache.clone();
-                    let slots = slots.clone();
-                    let offline_db = offline_db.clone();
-                    jobs.spawn(async move {
-                        let Ok(_permit) = slots.acquire_owned().await else {
-                            return;
-                        };
-                        if !session
-                            .data()
-                            .write()
-                            .await
-                            .claim_network_location_refresh(std::time::Instant::now())
-                        {
-                            return;
-                        }
-                        let Ok(Ok(response)) = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            session.scoped_rpc_client().collect_network_info(
-                                BaseController::default(),
-                                CollectNetworkInfoRequest::default(),
-                            ),
-                        )
-                        .await
-                        else {
-                            return;
-                        };
-                        Self::apply_network_location_snapshot(
-                            &session, &response, &cache, offline_db,
-                        )
-                        .await;
-                    });
-                }
-                while jobs.join_next().await.is_some() {}
-            }
-        });
     }
 
     async fn prune_sessions(sessions: &DashMap<url::Url, Arc<Session>>) {
@@ -583,252 +505,6 @@ impl ClientManager {
         s.data().read().await.location().cloned()
     }
 
-    pub fn lookup_ip_location(&self, ip: std::net::IpAddr) -> Option<Location> {
-        Self::lookup_ip(ip, self.geoip_db.clone())
-    }
-
-    pub async fn resolve_ip_location(&self, ip: std::net::IpAddr) -> Option<Location> {
-        Self::resolve_location(ip, self.city_geo_cache.as_ref(), self.geoip_db.clone()).await
-    }
-
-    pub async fn resolve_node_location(
-        &self,
-        node: &MyNodeInfo,
-    ) -> Option<(std::net::IpAddr, Location)> {
-        let ips = node_public_ips(node);
-        let public_ip = *ips.first()?;
-        let location = Self::resolve_node_ips(
-            &ips,
-            self.city_geo_cache.as_ref(),
-            self.geoip_db.clone(),
-            true,
-        )
-        .await?;
-        Some((public_ip, location))
-    }
-
-    /// Location for a set of public addresses of one node, IPv4 first.
-    pub async fn resolve_ips_location(&self, ips: &[std::net::IpAddr]) -> Option<Location> {
-        Self::resolve_node_ips(
-            ips,
-            self.city_geo_cache.as_ref(),
-            self.geoip_db.clone(),
-            true,
-        )
-        .await
-    }
-
-    async fn resolve_location(
-        ip: std::net::IpAddr,
-        cache: Option<&Arc<CityGeoCache>>,
-        offline_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
-    ) -> Option<Location> {
-        Self::node_candidate_location(ip, cache, offline_db, true).await
-    }
-
-    async fn node_candidate_location(
-        ip: std::net::IpAddr,
-        cache: Option<&Arc<CityGeoCache>>,
-        offline_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
-        observe: bool,
-    ) -> Option<Location> {
-        if let Some(cache) = cache {
-            let city = if observe {
-                cache.observe(ip).await
-            } else {
-                cache.peek(ip).await
-            };
-            if let Some(city) = city {
-                return Some(city.location.into_location());
-            }
-        }
-        Self::lookup_ip(ip, offline_db)
-    }
-
-    fn city_level_location(location: &Location) -> bool {
-        location
-            .city
-            .as_deref()
-            .is_some_and(|city| !city.trim().is_empty())
-            && location
-                .latitude
-                .is_some_and(|value| value.is_finite() && value.abs() <= 90.0)
-            && location
-                .longitude
-                .is_some_and(|value| value.is_finite() && value.abs() <= 180.0)
-    }
-
-    fn choose_node_location(first: Option<Location>, second: Option<Location>) -> Option<Location> {
-        if first.as_ref().is_some_and(Self::city_level_location) {
-            return first;
-        }
-        if second.as_ref().is_some_and(Self::city_level_location) {
-            return second;
-        }
-        let known_country = |location: &Location| {
-            !location.country.trim().is_empty()
-                && location.country != "海外"
-                && !location.country.eq_ignore_ascii_case("unknown")
-        };
-        if first.as_ref().is_some_and(known_country) {
-            return first;
-        }
-        if second.as_ref().is_some_and(known_country) {
-            return second;
-        }
-        first.or(second)
-    }
-
-    async fn resolve_node_ips(
-        ips: &[std::net::IpAddr],
-        cache: Option<&Arc<CityGeoCache>>,
-        offline_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
-        observe: bool,
-    ) -> Option<Location> {
-        let first = *ips.first()?;
-        if let Some(second) = ips.get(1) {
-            // Observe both families even on an IPv4 hit, so the background
-            // worker can recover through the same node's alternate family.
-            let (first, second) = tokio::join!(
-                Self::node_candidate_location(first, cache, offline_db.clone(), observe),
-                Self::node_candidate_location(*second, cache, offline_db, observe),
-            );
-            return Self::choose_node_location(first, second);
-        }
-        Self::node_candidate_location(first, cache, offline_db, observe).await
-    }
-
-    fn snapshot_public_ips(
-        response: &CollectNetworkInfoResponse,
-    ) -> Option<Vec<Vec<std::net::IpAddr>>> {
-        let info = response.info.as_ref()?;
-        if info.map.is_empty() {
-            return None;
-        }
-        let mut addresses: Vec<_> = info
-            .map
-            .iter()
-            .filter(|(_, detail)| detail.running)
-            .filter_map(|(instance, detail)| {
-                let ips = node_public_ips(detail.my_node_info.as_ref()?);
-                (!ips.is_empty()).then_some((instance, ips))
-            })
-            .collect();
-        addresses.sort_by(|(left, left_ips), (right, right_ips)| {
-            left_ips[0]
-                .is_ipv6()
-                .cmp(&right_ips[0].is_ipv6())
-                .then_with(|| left.cmp(right))
-        });
-        Some(addresses.into_iter().map(|(_, ips)| ips).collect())
-    }
-
-    async fn apply_network_location_snapshot(
-        session: &Arc<Session>,
-        response: &CollectNetworkInfoResponse,
-        cache: &Arc<CityGeoCache>,
-        offline_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
-    ) {
-        {
-            let data = session.data();
-            let mut data = data.write().await;
-            if !data.has_running_network() {
-                data.clear_network_location();
-                return;
-            }
-        }
-        // An empty metadata response can be transient while heartbeats still
-        // report running networks. It never extends the verification grace.
-        let Some(ips) = Self::snapshot_public_ips(response) else {
-            return;
-        };
-        let verified_at = std::time::Instant::now();
-        let mut primary = None;
-        for ips in ips {
-            let location =
-                Self::resolve_node_ips(&ips, Some(cache), offline_db.clone(), true).await;
-            if primary.is_none() {
-                primary = location.map(|location| (ips, location));
-            }
-        }
-        let data = session.data();
-        let mut data = data.write().await;
-        data.apply_network_location_snapshot(primary, verified_at);
-    }
-
-    #[cfg(test)]
-    async fn cached_location(
-        ip: std::net::IpAddr,
-        cache: &Arc<CityGeoCache>,
-        offline_db: Arc<Option<maxminddb::Reader<Vec<u8>>>>,
-    ) -> Option<Location> {
-        Self::node_candidate_location(ip, Some(cache), offline_db, false).await
-    }
-
-    pub async fn cached_network_location(
-        &self,
-        client_url: &url::Url,
-    ) -> Option<(String, Location)> {
-        let session = self.client_sessions.get(client_url)?.clone();
-        if let Some(cache) = &self.city_geo_cache {
-            let (cached, ips) = {
-                let data = session.data();
-                let data = data.read().await;
-                let verified_at = std::time::Instant::now();
-                let cached = data.verified_network_location(verified_at).cloned()?;
-                let ips = data.verified_network_location_ips(verified_at)?.to_vec();
-                (cached, ips)
-            };
-            let location =
-                Self::resolve_node_ips(&ips, Some(cache), self.geoip_db.clone(), false).await?;
-            return Some((cached.0, location));
-        }
-        session.data().read().await.network_location().cloned()
-    }
-
-    pub async fn cache_network_location(
-        &self,
-        user_id: UserIdInDb,
-        machine_id: uuid::Uuid,
-        node: &MyNodeInfo,
-        location: Location,
-    ) {
-        if let Some(session) = self.get_session_by_machine_id(user_id, &machine_id) {
-            let data = session.data();
-            let mut data = data.write().await;
-            if data.has_running_network() {
-                data.set_node_network_location_at(
-                    node_public_ips(node),
-                    location,
-                    std::time::Instant::now(),
-                );
-            }
-        }
-    }
-
-    pub async fn begin_network_location_refresh(
-        &self,
-        user_id: UserIdInDb,
-        machine_id: uuid::Uuid,
-    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        let permit = self
-            .network_location_refresh_slots
-            .clone()
-            .try_acquire_owned()
-            .ok()?;
-        let session = self.get_session_by_machine_id(user_id, &machine_id)?;
-        if session
-            .data()
-            .write()
-            .await
-            .claim_network_location_refresh(std::time::Instant::now())
-        {
-            Some(permit)
-        } else {
-            None
-        }
-    }
-
     fn db(&self) -> &Db {
         self.storage.db()
     }
@@ -986,16 +662,11 @@ impl
         &self,
         identify: &(UserIdInDb, uuid::Uuid),
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        Some(
-            self.storage
-                .runtime_mutation_lock(*identify)
-                .lock_owned()
-                .await,
-        )
+        self.runtime_mutation_guard_impl(identify).await
     }
 
     async fn manages_local_configs(&self, identify: &(UserIdInDb, uuid::Uuid)) -> bool {
-        self.supports_local_configs(identify).await
+        self.manages_local_configs_impl(identify).await
     }
 
     async fn on_network_info_collected(
@@ -1004,72 +675,37 @@ impl
         full_snapshot: bool,
         response: &mut CollectNetworkInfoResponse,
     ) {
-        if full_snapshot
-            && let Some(cache) = &self.city_geo_cache
-            && let Some(session) = self.get_session_by_machine_id(identify.0, &identify.1)
-        {
-            Self::apply_network_location_snapshot(&session, response, cache, self.geoip_db.clone())
-                .await;
-        }
+        self.on_network_info_collected_impl(identify, full_snapshot, response)
+            .await
     }
 
     async fn verify_network_instance_stopped(
         &self,
-        _identify: &(UserIdInDb, uuid::Uuid),
+        identify: &(UserIdInDb, uuid::Uuid),
         inst_id: &uuid::Uuid,
         response: &DeleteNetworkInstanceResponse,
     ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
-        if response.remain_inst_ids.contains(&(*inst_id).into()) {
-            return Err(RemoteClientError::Other(format!(
-                "network instance {inst_id} could not be stopped"
-            )));
-        }
-        Ok(())
+        self.verify_network_instance_stopped_impl(identify, inst_id, response)
+            .await
     }
 
     async fn list_network_instance_ids_for_local_config(
         &self,
         identify: (UserIdInDb, uuid::Uuid),
     ) -> Result<ListNetworkInstanceIdsJsonResp, RemoteClientError<sea_orm::DbErr>> {
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        let ret = client
-            .list_network_instance(BaseController::default(), ListNetworkInstanceRequest {})
-            .await?;
-        // The node's own catalog reports running and disabled instances; the
-        // web database only mirrors read-only observations for these nodes.
-        Ok(ListNetworkInstanceIdsJsonResp {
-            running_inst_ids: ret.inst_ids.into_iter().collect(),
-            disabled_inst_ids: ret.disabled_inst_ids.into_iter().collect(),
-            runtime_capabilities: ret.runtime_capabilities,
-        })
+        self.list_network_instance_ids_for_local_config_impl(identify)
+            .await
     }
 
     async fn run_network_instance_for_local_config(
         &self,
         identify: (UserIdInDb, uuid::Uuid),
         config: easytier::proto::api::manage::NetworkConfig,
-        _save: bool,
+        save: bool,
         source: ConfigSource,
     ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        client
-            .run_network_instance(
-                BaseController::default(),
-                RunNetworkInstanceRequest {
-                    inst_id: None,
-                    config: Some(config),
-                    overwrite: true,
-                    source: config_source_to_rpc(source),
-                },
-            )
-            .await?;
-        // The core persists the config file in its working directory; the web
-        // console keeps nothing.
-        Ok(())
+        self.run_network_instance_for_local_config_impl(identify, config, save, source)
+            .await
     }
 
     async fn handle_remove_network_instances(
@@ -1077,85 +713,8 @@ impl
         identify: (UserIdInDb, uuid::Uuid),
         inst_ids: Vec<uuid::Uuid>,
     ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
-        if inst_ids.is_empty() {
-            return Ok(());
-        }
-        let _mutation = self
-            .storage
-            .runtime_mutation_lock(identify)
-            .lock_owned()
-            .await;
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        let local_configs = self.supports_local_configs(&identify).await;
-        let complete_delete = local_configs
-            && client
-                .list_network_instance(BaseController::default(), ListNetworkInstanceRequest {})
-                .await?
-                .supports_persisted_config_management
-                == Some(true);
-        let response = client
-            .delete_network_instance(
-                BaseController::default(),
-                DeleteNetworkInstanceRequest {
-                    inst_ids: inst_ids.iter().copied().map(Into::into).collect(),
-
-                    ..Default::default()
-                },
-            )
-            .await?;
-        let mut remaining: HashSet<Uuid> = response
-            .remain_inst_ids
-            .into_iter()
-            .map(Into::into)
-            .filter(|id| inst_ids.contains(id))
-            .collect();
-        if local_configs && !complete_delete {
-            // Older local-config cores only delete running instances. Never
-            // pass a refused deletion on to their config-only removal RPC.
-            let stopped: Vec<_> = inst_ids
-                .iter()
-                .filter(|id| !remaining.contains(id))
-                .copied()
-                .map(Into::into)
-                .collect();
-            if !stopped.is_empty() {
-                let response = client
-                    .remove_network_instance_config(
-                        BaseController::default(),
-                        RemoveNetworkInstanceConfigRequest {
-                            inst_ids: stopped,
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
-                remaining.extend(response.remain_inst_ids.into_iter().map(Uuid::from));
-            }
-        }
-        if !local_configs {
-            let removed: Vec<_> = inst_ids
-                .iter()
-                .filter(|id| !remaining.contains(id))
-                .copied()
-                .collect();
-            self.get_storage()
-                .delete_network_configs(identify, &removed)
-                .await
-                .map_err(RemoteClientError::PersistentError)?;
-        }
-        if !remaining.is_empty() {
-            return Err(RemoteClientError::Other(format!(
-                "failed to delete network instances: {}",
-                inst_ids
-                    .iter()
-                    .filter(|id| remaining.contains(id))
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-        Ok(())
+        self.handle_remove_network_instances_impl(identify, inst_ids)
+            .await
     }
 
     async fn update_network_state_for_local_config(
@@ -1164,26 +723,8 @@ impl
         inst_id: uuid::Uuid,
         disabled: bool,
     ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        // Both directions go through set_network_instance_enabled. Enable
-        // restores the instance from its on-disk config file, mirroring the
-        // disable path and avoiding the redundant NetworkConfig<->TOML
-        // round-trip + file rewrite that run_network_instance(overwrite=true)
-        // would perform.
-        client
-            .set_network_instance_enabled(
-                BaseController::default(),
-                SetNetworkInstanceEnabledRequest {
-                    inst_id: Some(inst_id.into()),
-                    enabled: !disabled,
-
-                    ..Default::default()
-                },
-            )
-            .await?;
-        Ok(())
+        self.update_network_state_for_local_config_impl(identify, inst_id, disabled)
+            .await
     }
 
     async fn save_network_config_for_local_config(
@@ -1193,20 +734,8 @@ impl
         config: easytier::proto::api::manage::NetworkConfig,
         source: ConfigSource,
     ) -> Result<(), RemoteClientError<sea_orm::DbErr>> {
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        client
-            .save_network_instance_config(
-                BaseController::default(),
-                SaveNetworkInstanceConfigRequest {
-                    inst_id: Some(inst_id.into()),
-                    config: Some(config),
-                    source: config_source_to_rpc(source),
-                },
-            )
-            .await?;
-        Ok(())
+        self.save_network_config_for_local_config_impl(identify, inst_id, config, source)
+            .await
     }
 
     async fn get_network_config_for_local_config(
@@ -1217,52 +746,83 @@ impl
         (easytier::proto::api::manage::NetworkConfig, ConfigSource),
         RemoteClientError<sea_orm::DbErr>,
     > {
-        let client = self
-            .get_rpc_client(identify)
-            .ok_or(RemoteClientError::ClientNotFound)?;
-        let resp = client
-            .get_network_instance_config(
-                BaseController::default(),
-                GetNetworkInstanceConfigRequest {
-                    inst_id: Some(inst_id.into()),
-                },
-            )
-            .await?;
-        let config = resp.config.ok_or_else(|| {
-            RemoteClientError::NotFound(format!("No such network instance: {}", inst_id))
-        })?;
-        Ok((
-            config,
-            config_source_from_rpc(resp.source).unwrap_or(ConfigSource::User),
-        ))
+        self.get_network_config_for_local_config_impl(identify, inst_id)
+            .await
     }
-}
 
-impl ClientManager {
-    pub(crate) async fn supports_local_configs(&self, identify: &(UserIdInDb, uuid::Uuid)) -> bool {
-        let (user_id, machine_id) = *identify;
-        let Some(session) = self.get_session_by_machine_id(user_id, &machine_id) else {
-            // Remember legacy custom nodes too; an offline observation never
-            // becomes desired state for the official publisher.
-            return match self
-                .storage
-                .db()
-                .known_local_config_mode(user_id, machine_id)
+    async fn handle_get_network_config_with_source(
+        &self,
+        identify @ (user_id, machine_id): (UserIdInDb, uuid::Uuid),
+        inst_id: uuid::Uuid,
+    ) -> Result<(NetworkConfig, ConfigSource), RemoteClientError<sea_orm::DbErr>> {
+        if self.manages_local_configs_impl(&identify).await {
+            return self
+                .get_network_config_for_local_config_impl(identify, inst_id)
+                .await;
+        }
+        if let Some(session) = self.get_session_by_machine_id(user_id, &machine_id)
+            && let Ok(response) = session
+                .scoped_rpc_client()
+                .get_network_instance_config(
+                    BaseController::default(),
+                    GetNetworkInstanceConfigRequest {
+                        inst_id: Some(inst_id.into()),
+                    },
+                )
                 .await
-            {
-                Ok(local) => local,
-                Err(error) => {
-                    tracing::warn!(%error, "node management mode unavailable; deferring managed publication");
-                    true
-                }
+            && let Some(mut config) = response.config
+        {
+            let source = config_source_from_rpc(response.source);
+            let retain_saved_dns = session
+                .get_heartbeat_req()
+                .await
+                .is_none_or(|heartbeat| heartbeat.support_dns_config_patch != Some(true));
+            let saved = if retain_saved_dns || source.is_none() {
+                self.storage
+                    .db()
+                    .get_network_config(identify, &inst_id.to_string())
+                    .await
+                    .map_err(RemoteClientError::PersistentError)?
+            } else {
+                None
             };
-        };
-        session.data().read().await.support_local_configs()
+            if retain_saved_dns && let Some(saved) = &saved {
+                // The editor must retain DNS intent that this core cannot return.
+                config.dns = saved
+                    .get_network_config()
+                    .map_err(RemoteClientError::PersistentError)?
+                    .dns;
+            }
+            let source = source.unwrap_or_else(|| {
+                saved
+                    .map(|config| config.get_runtime_network_config_source())
+                    .unwrap_or(ConfigSource::User)
+            });
+            return Ok((config, source));
+        }
+        let saved = self
+            .storage
+            .db()
+            .get_network_config(identify, &inst_id.to_string())
+            .await
+            .map_err(RemoteClientError::PersistentError)?
+            .ok_or_else(|| {
+                RemoteClientError::NotFound(format!("No such network instance: {inst_id}"))
+            })?;
+        Ok((
+            saved
+                .get_network_config()
+                .map_err(RemoteClientError::PersistentError)?,
+            saved.get_runtime_network_config_source(),
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    mod custom_tests;
+
     use std::{
         collections::VecDeque,
         future::Future,
@@ -1305,269 +865,6 @@ mod tests {
     };
 
     const MANAGED_CONFIG_TOKEN: &str = "managed-config-token";
-
-    #[test]
-    fn embedded_geoip_location_covers_global_ipv4_and_ipv6() {
-        let db = Arc::new(super::load_geoip_db(None));
-        let mut countries = std::collections::HashSet::new();
-        for ip in ["223.5.5.5", "8.8.8.8", "2001:4860:4860::8888"] {
-            let ip = ip.parse().unwrap();
-            let country = db
-                .as_ref()
-                .as_ref()
-                .unwrap()
-                .lookup(ip)
-                .unwrap()
-                .decode::<maxminddb::geoip2::Country>()
-                .unwrap()
-                .unwrap();
-            let code = country.country.iso_code.unwrap();
-            assert_eq!(code.len(), 2);
-            assert!(code.bytes().all(|value| value.is_ascii_uppercase()));
-            countries.insert(code.to_string());
-            let location = ClientManager::lookup_ip(ip, db.clone()).unwrap();
-            assert_ne!(location.country, "海外");
-            assert!(location.latitude.is_none());
-            assert!(location.longitude.is_none());
-        }
-        // Anycast locations vary between database releases. Require genuine
-        // global coverage instead of pinning their geography to ownership.
-        assert!(countries.contains("CN"));
-        assert!(countries.len() >= 2);
-    }
-
-    #[test]
-    fn full_snapshot_distinguishes_transient_empty_metadata_from_missing_ips() {
-        use easytier::proto::api::manage::{
-            CollectNetworkInfoResponse, MyNodeInfo, NetworkInstanceRunningInfo,
-            NetworkInstanceRunningInfoMap,
-        };
-        let mut response = CollectNetworkInfoResponse::default();
-        assert_eq!(ClientManager::snapshot_public_ips(&response), None);
-        response.info = Some(NetworkInstanceRunningInfoMap::default());
-        assert_eq!(ClientManager::snapshot_public_ips(&response), None);
-        response.info.as_mut().unwrap().map.insert(
-            "instance".to_string(),
-            NetworkInstanceRunningInfo {
-                running: true,
-                my_node_info: Some(MyNodeInfo::default()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(ClientManager::snapshot_public_ips(&response), Some(vec![]));
-        response
-            .info
-            .as_mut()
-            .unwrap()
-            .map
-            .get_mut("instance")
-            .unwrap()
-            .running = false;
-        assert_eq!(ClientManager::snapshot_public_ips(&response), Some(vec![]));
-    }
-
-    #[tokio::test]
-    async fn stale_or_failed_city_reads_fall_back_to_offline_coordinates() {
-        let offline = Arc::new(super::load_geoip_db(None));
-        let cache = crate::geolocation::CityGeoCache::test_memory(crate::geolocation::Options {
-            offline: true,
-            ..Default::default()
-        })
-        .await;
-        let ip = "1.1.1.1".parse().unwrap();
-        let city = crate::geolocation::CityLocation {
-            country: "New Zealand".to_string(),
-            city: "Auckland".to_string(),
-            region: None,
-            latitude: -36.85,
-            longitude: 174.76,
-            accuracy_radius_km: None,
-        };
-        let at = chrono::Utc::now().timestamp();
-        cache.test_seed(ip, &city, at).await;
-        let fresh = ClientManager::cached_location(ip, &cache, offline.clone())
-            .await
-            .unwrap();
-        assert_eq!(fresh.city.as_deref(), Some("Auckland"));
-        assert_eq!(fresh.latitude, Some(-36.85));
-        cache.test_seed(ip, &city, at - 8 * 86_400).await;
-        let expected = ClientManager::lookup_ip(ip, offline.clone()).unwrap();
-        let stale = ClientManager::cached_location(ip, &cache, offline.clone())
-            .await
-            .unwrap();
-        assert_eq!(stale.country, expected.country);
-        assert_eq!(stale.city, expected.city);
-        assert_eq!(stale.latitude, expected.latitude);
-        assert_eq!(stale.longitude, expected.longitude);
-        cache.test_close().await;
-        let failed = ClientManager::cached_location(ip, &cache, offline)
-            .await
-            .unwrap();
-        assert_eq!(failed.country, expected.country);
-        assert_eq!(failed.latitude, expected.latitude);
-        assert_eq!(failed.longitude, expected.longitude);
-    }
-
-    fn dual_stack_geo_node() -> easytier::proto::api::manage::MyNodeInfo {
-        easytier::proto::api::manage::MyNodeInfo {
-            stun_info: Some(easytier::proto::common::StunInfo {
-                public_ip: vec!["2001:4860:4860::8888".into(), "1.1.1.1".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    async fn dual_stack_geo_manager() -> (ClientManager, Arc<crate::geolocation::CityGeoCache>) {
-        let cache = crate::geolocation::CityGeoCache::test_memory(crate::geolocation::Options {
-            offline: true,
-            ..Default::default()
-        })
-        .await;
-        let mut manager = ClientManager::new(
-            Db::memory_db().await,
-            None,
-            HeartbeatPolicy::default(),
-            Arc::new(FeatureFlags::default()),
-            Arc::new(crate::webhook::WebhookConfig::new(
-                None, None, None, None, None,
-            )),
-        );
-        manager.city_geo_cache = Some(cache.clone());
-        (manager, cache)
-    }
-
-    fn geo_city(name: &str, latitude: f64) -> crate::geolocation::CityLocation {
-        crate::geolocation::CityLocation {
-            country: "New Zealand".to_string(),
-            city: name.to_string(),
-            region: None,
-            latitude,
-            longitude: 174.76,
-            accuracy_radius_km: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn ipv6_city_fallback_keeps_ipv4_display_and_ipv4_city_wins_when_available() {
-        let (manager, cache) = dual_stack_geo_manager().await;
-        let node = dual_stack_geo_node();
-        let v4 = "1.1.1.1".parse().unwrap();
-        let v6 = "2001:4860:4860::8888".parse().unwrap();
-        cache
-            .test_seed(
-                v6,
-                &geo_city("IPv6 City", -36.85),
-                chrono::Utc::now().timestamp(),
-            )
-            .await;
-        let (display, fallback) = manager.resolve_node_location(&node).await.unwrap();
-        assert_eq!(display, v4);
-        assert_eq!(fallback.city.as_deref(), Some("IPv6 City"));
-        assert_eq!(fallback.latitude, Some(-36.85));
-        cache
-            .test_seed(
-                v4,
-                &geo_city("IPv4 City", -41.29),
-                chrono::Utc::now().timestamp(),
-            )
-            .await;
-        let (display, preferred) = manager.resolve_node_location(&node).await.unwrap();
-        assert_eq!(display, v4);
-        assert_eq!(preferred.city.as_deref(), Some("IPv4 City"));
-        assert_eq!(preferred.latitude, Some(-41.29));
-        let cached = ClientManager::resolve_node_ips(
-            &crate::geolocation::node_public_ips(&node),
-            Some(&cache),
-            manager.geoip_db.clone(),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(cached.city.as_deref(), Some("IPv4 City"));
-    }
-
-    #[tokio::test]
-    async fn every_verified_node_family_is_queued_without_cross_node_fallback() {
-        let (manager, cache) = dual_stack_geo_manager().await;
-        let node = dual_stack_geo_node();
-        manager.resolve_node_location(&node).await.unwrap();
-        let mut queued = cache.test_due_ips().await;
-        queued.sort();
-        let mut expected = crate::geolocation::node_public_ips(&node);
-        expected.sort();
-        assert_eq!(queued, expected);
-        cache
-            .test_seed(
-                "2001:4860:4860::8888".parse().unwrap(),
-                &geo_city("Other Node City", -36.85),
-                chrono::Utc::now().timestamp(),
-            )
-            .await;
-        let unrelated = easytier::proto::api::manage::MyNodeInfo {
-            stun_info: Some(easytier::proto::common::StunInfo {
-                public_ip: vec!["9.9.9.9".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let (display, location) = manager.resolve_node_location(&unrelated).await.unwrap();
-        assert_eq!(display, "9.9.9.9".parse::<std::net::IpAddr>().unwrap());
-        assert_ne!(location.city.as_deref(), Some("Other Node City"));
-        assert!(location.latitude.is_none());
-        assert!(location.longitude.is_none());
-    }
-
-    #[test]
-    fn snapshot_keeps_candidates_grouped_by_node_and_ipv4_nodes_first() {
-        use easytier::proto::api::manage::{
-            CollectNetworkInfoResponse, NetworkInstanceRunningInfo, NetworkInstanceRunningInfoMap,
-        };
-        let v6_only = easytier::proto::api::manage::MyNodeInfo {
-            stun_info: Some(easytier::proto::common::StunInfo {
-                public_ip: vec!["2001:4860:4860::8844".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let response = CollectNetworkInfoResponse {
-            info: Some(NetworkInstanceRunningInfoMap {
-                map: [
-                    (
-                        "a".to_string(),
-                        NetworkInstanceRunningInfo {
-                            running: true,
-                            my_node_info: Some(v6_only),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "z".to_string(),
-                        NetworkInstanceRunningInfo {
-                            running: true,
-                            my_node_info: Some(dual_stack_geo_node()),
-                            ..Default::default()
-                        },
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            }),
-        };
-        let groups = ClientManager::snapshot_public_ips(&response).unwrap();
-        assert_eq!(groups.len(), 2);
-        assert_eq!(
-            groups[0],
-            vec![
-                "1.1.1.1".parse::<std::net::IpAddr>().unwrap(),
-                "2001:4860:4860::8888".parse().unwrap(),
-            ]
-        );
-        assert_eq!(
-            groups[1],
-            vec!["2001:4860:4860::8844".parse::<std::net::IpAddr>().unwrap()]
-        );
-    }
 
     #[test]
     fn heartbeat_policy_validates_server_configuration() {
@@ -1857,46 +1154,6 @@ mod tests {
         .unwrap()
     }
 
-    async fn wait_for_local_config_capability(
-        mgr: &ClientManager,
-        user_id: i32,
-        machine_id: uuid::Uuid,
-    ) {
-        wait_for_condition(
-            || async { mgr.supports_local_configs(&(user_id, machine_id)).await },
-            Duration::from_secs(12),
-        )
-        .await;
-    }
-
-    fn local_config_instance_manager(config_dir: std::path::PathBuf) -> Arc<NativeInstanceManager> {
-        Arc::new(native_instance_manager().with_config_path(Some(config_dir)))
-    }
-
-    async fn assert_no_managed_config_state(
-        mgr: &ClientManager,
-        user_id: i32,
-        machine_id: uuid::Uuid,
-        instance_id: uuid::Uuid,
-    ) {
-        assert!(
-            mgr.db()
-                .get_network_config((user_id, machine_id), &instance_id.to_string())
-                .await
-                .unwrap()
-                .is_none(),
-            "local-authority core must not create a managed config row"
-        );
-        assert!(
-            mgr.db()
-                .get_managed_config_revision((user_id, machine_id))
-                .await
-                .unwrap()
-                .is_none(),
-            "local-authority core must not create a managed config revision"
-        );
-    }
-
     async fn wait_for_validate_count(state: &TestWebhookState, target: usize) {
         tokio::time::timeout(Duration::from_secs(12), async {
             loop {
@@ -2079,7 +1336,6 @@ mod tests {
         assert_eq!(updated.disable_upnp, Some(true));
         assert_eq!(updated.disable_relay_data, Some(true));
         assert_eq!(updated.enable_magic_dns, Some(true));
-        assert_eq!(updated.tld_dns_zone.as_deref(), Some("nas.internal."));
         // Runtime projections omit flags that match the Custom defaults.
         // Check the effective setting after the managed-config round trip.
         assert!(updated.gen_config().unwrap().get_flags().private_mode);
@@ -2108,7 +1364,6 @@ mod tests {
             "relay_all_peer_rpc": false,
             "multi_thread": false,
             "disable_relay_data": false,
-            "tld_dns_zone": "initial.internal.",
             "mtu": 1380
         })
     }
@@ -2159,7 +1414,6 @@ mod tests {
             disable_upnp: Some(true),
             disable_relay_data: Some(true),
             enable_magic_dns: Some(true),
-            tld_dns_zone: Some("nas.internal.".to_owned()),
             enable_private_mode: Some(true),
             mtu: Some(1360),
             data_compress_algo: Some(CompressionAlgoPb::Zstd as i32),
@@ -2278,302 +1532,300 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_delete_keeps_rejected_configs_in_web_storage() {
-        use easytier_core::management::{ConfigFileControl, ConfigFilePermission};
-
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
-        let mut mgr = ClientManager::new(
-            Db::memory_db().await,
-            None,
-            HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
-            Arc::new(FeatureFlags::default()),
-            webhook_config,
-        );
-        let server_addr = add_random_udp_listener(&mut mgr).await;
-        let core_manager = Arc::new(native_instance_manager());
-        let machine_id = uuid::Uuid::new_v4();
-        let client = start_web_client_for_test(server_addr, machine_id, core_manager.clone()).await;
-        let user_id = wait_for_validated_user(&mgr, machine_id).await;
-        let identify = (user_id, machine_id);
-        wait_for_condition(
-            || async { mgr.handle_list_network_instance_ids(identify).await.is_ok() },
-            Duration::from_secs(12),
-        )
-        .await;
-        let removable_id = uuid::Uuid::new_v4();
-        let protected_id = uuid::Uuid::new_v4();
-        for id in [removable_id, protected_id] {
-            let config = NetworkConfig {
-                instance_id: Some(id.to_string()),
-                network_name: Some(format!("legacy-delete-{id}")),
-                networking_method: Some(NetworkingMethod::Standalone as i32),
-                no_tun: Some(true),
-                disable_p2p: Some(true),
-                ..Default::default()
-            };
-            let permission = if id == protected_id {
-                ConfigFilePermission::from(ConfigFilePermission::NO_DELETE)
-            } else {
-                ConfigFilePermission::default()
-            };
-            core_manager
-                .run_network_instance(
-                    config.gen_config().unwrap(),
-                    ConfigFileControl::new(None, permission),
-                )
-                .unwrap();
-            mgr.db()
-                .insert_or_update_user_network_config(identify, id, config, ConfigSource::User)
-                .await
-                .unwrap();
-        }
-        assert!(
-            mgr.handle_update_network_state(identify, protected_id, true)
-                .await
-                .is_err()
-        );
-        assert!(
-            !mgr.db()
-                .get_network_config(identify, &protected_id.to_string())
-                .await
-                .unwrap()
-                .unwrap()
-                .disabled
-        );
-        let error = mgr
-            .handle_remove_network_instances(identify, vec![removable_id, protected_id])
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(&protected_id.to_string()));
-        assert!(!error.to_string().contains(&removable_id.to_string()));
-        assert!(
-            core_manager.instance(removable_id).is_none(),
-            "removable instance survived: {error}"
-        );
-        assert!(core_manager.instance(protected_id).is_some());
-        assert!(
-            mgr.db()
-                .get_network_config(identify, &removable_id.to_string())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            mgr.db()
-                .get_network_config(identify, &protected_id.to_string())
-                .await
-                .unwrap()
-                .is_some()
-        );
-
-        // A later heartbeat must not resurrect the successfully deleted row.
-        let session = mgr.get_session_by_machine_id(user_id, &machine_id).unwrap();
-        wait_for_condition(
-            || async {
-                session.get_heartbeat_req().await.is_some_and(|req| {
-                    req.running_network_instances.contains(&protected_id.into())
-                        && !req.running_network_instances.contains(&removable_id.into())
-                })
+    async fn dns_edit_readback_preserves_saved_intent_without_replacing_observed_fields() {
+        use easytier::proto::{
+            api::manage::{
+                GetNetworkInstanceConfigRequest, GetNetworkInstanceConfigResponse,
+                ListNetworkInstanceMetaResponse, ListNetworkInstanceResponse,
+                RunNetworkInstanceRequest, RunNetworkInstanceResponse, ValidateConfigRequest,
+                ValidateConfigResponse, WebClientServiceDescriptor,
+                WebClientServiceMethodDescriptor,
             },
-            Duration::from_secs(12),
-        )
-        .await;
-        assert!(core_manager.instance(removable_id).is_none());
+            rpc::bidirect::BidirectRpcManager,
+            rpc_types::handler::Handler,
+            web::{HeartbeatRequest, WebServerServiceClientFactory},
+        };
+        use prost::Message as _;
 
-        client.shutdown().await;
-        core_manager.retain_network_instances(&[]).await.unwrap();
-        webhook_server.abort();
-    }
+        #[derive(Default)]
+        struct Requests {
+            runs: Vec<RunNetworkInstanceRequest>,
+            validations: Vec<ValidateConfigRequest>,
+            runtime_config: Option<NetworkConfig>,
+        }
+        #[derive(Clone)]
+        struct Recorder {
+            instance_id: uuid::Uuid,
+            requests: Arc<std::sync::Mutex<Requests>>,
+        }
+        #[async_trait::async_trait]
+        impl Handler for Recorder {
+            type Descriptor = WebClientServiceDescriptor;
+            type Controller = super::BaseController;
 
-    #[tokio::test]
-    async fn local_config_delete_reports_protected_networks_and_removes_other_configs() {
-        use easytier::common::config::{ConfigLoader as _, load_config_from_file};
+            async fn call(
+                &self,
+                _: Self::Controller,
+                method: WebClientServiceMethodDescriptor,
+                input: prost::bytes::Bytes,
+            ) -> easytier::proto::rpc_types::error::Result<prost::bytes::Bytes> {
+                let mut requests = self.requests.lock().unwrap();
+                let response = match method {
+                    WebClientServiceMethodDescriptor::RunNetworkInstance => {
+                        let request = RunNetworkInstanceRequest::decode(input)?;
+                        requests.runtime_config = request.config.clone();
+                        requests.runs.push(request);
+                        RunNetworkInstanceResponse {
+                            inst_id: Some(self.instance_id.into()),
+                        }
+                        .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ValidateConfig => {
+                        requests
+                            .validations
+                            .push(ValidateConfigRequest::decode(input)?);
+                        ValidateConfigResponse::default().encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::GetNetworkInstanceConfig => {
+                        let request = GetNetworkInstanceConfigRequest::decode(input)?;
+                        assert_eq!(
+                            request.inst_id.map(uuid::Uuid::from),
+                            Some(self.instance_id)
+                        );
+                        GetNetworkInstanceConfigResponse {
+                            config: requests.runtime_config.clone(),
+                            source: easytier::proto::api::manage::ConfigSource::User as i32,
+                        }
+                        .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::DeleteNetworkInstance => {
+                        requests.runtime_config = None;
+                        easytier::proto::api::manage::DeleteNetworkInstanceResponse::default()
+                            .encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ListNetworkInstance => {
+                        ListNetworkInstanceResponse::default().encode_to_vec()
+                    }
+                    WebClientServiceMethodDescriptor::ListNetworkInstanceMeta => {
+                        ListNetworkInstanceMetaResponse::default().encode_to_vec()
+                    }
+                    _ => panic!("unexpected direct runtime method: {method:?}"),
+                };
+                Ok(response.into())
+            }
+        }
 
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
-        let mut mgr = ClientManager::new(
-            Db::memory_db().await,
+        let db = Db::memory_db().await;
+        let mgr = ClientManager::new(
+            db.clone(),
             None,
-            HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
+            HeartbeatPolicy::default(),
             Arc::new(FeatureFlags::default()),
-            webhook_config,
+            Arc::new(crate::webhook::WebhookConfig::new(
+                None, None, None, None, None,
+            )),
         );
-        let server_addr = add_random_udp_listener(&mut mgr).await;
-        let config_dir =
-            std::env::temp_dir().join(format!("easytier-web-delete-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let core_manager = local_config_instance_manager(config_dir.clone());
+        let user_id = db
+            .auto_create_user("dns-capability-token")
+            .await
+            .unwrap()
+            .id;
         let machine_id = uuid::Uuid::new_v4();
-        let client = start_web_client_for_test(server_addr, machine_id, core_manager.clone()).await;
-        let user_id = wait_for_validated_user(&mgr, machine_id).await;
-        wait_for_local_config_capability(&mgr, user_id, machine_id).await;
+        let instance_id = uuid::Uuid::new_v4();
         let identify = (user_id, machine_id);
-        let running_id = uuid::Uuid::new_v4();
-        let saved_id = uuid::Uuid::new_v4();
-        let protected_id = uuid::Uuid::new_v4();
-        let network = |id: uuid::Uuid| NetworkConfig {
-            instance_id: Some(id.to_string()),
-            network_name: Some(format!("delete-test-{id}")),
+        let saved = NetworkConfig {
+            instance_id: Some(instance_id.to_string()),
+            hostname: Some("dns-capability-host".to_owned()),
             networking_method: Some(NetworkingMethod::Standalone as i32),
-            no_tun: Some(true),
-            disable_p2p: Some(true),
+            dns: Some(easytier::proto::core_config::DnsConfigRaw {
+                domain: Some("retained.test".to_owned()),
+                zone: None,
+            }),
             ..Default::default()
         };
-        mgr.handle_run_network_instance(identify, network(running_id), true)
-            .await
-            .unwrap();
-        mgr.handle_save_network_config(identify, saved_id, network(saved_id))
-            .await
-            .unwrap();
+        assert!(matches!(
+            mgr.handle_validate_config(identify, saved.clone()).await,
+            Err(super::RemoteClientError::ClientNotFound)
+        ));
+        assert!(matches!(
+            mgr.handle_run_network_instance(identify, saved.clone(), true)
+                .await,
+            Err(super::RemoteClientError::ClientNotFound)
+        ));
 
-        let mut protected = network(protected_id);
-        protected.network_secret =
-            Some("${EASYTIER_WEB_DELETE_TEST_UNSET_SECRET:-protected-secret}".to_string());
-        let protected = protected.gen_config().unwrap();
-        protected.set_listeners(Vec::new());
-        let protected_path = config_dir.join(format!("{protected_id}.toml"));
-        std::fs::write(&protected_path, protected.dump()).unwrap();
-        let (protected, control) = load_config_from_file(&protected_path, Some(&config_dir), false)
+        let requests = Arc::new(std::sync::Mutex::new(Requests::default()));
+        let rpc = BidirectRpcManager::new();
+        rpc.rpc_server().registry().register(
+            Recorder {
+                instance_id,
+                requests: requests.clone(),
+            },
+            "",
+        );
+        let client_url = "ring://dns-capability".parse::<url::Url>().unwrap();
+        let mut session = Session::new(
+            mgr.storage.weak_ref(),
+            client_url.clone(),
+            None,
+            HeartbeatPolicy::default(),
+            Arc::new(FeatureFlags::default()),
+            Arc::new(crate::webhook::WebhookConfig::new(
+                None, None, None, None, None,
+            )),
+            1,
+        );
+        session.serve(rpc.run_and_create_tunnel()).await;
+        let session = Arc::new(session);
+        mgr.client_sessions
+            .insert(client_url.clone(), session.clone());
+        mgr.storage.update_client(
+            StorageToken {
+                token: "dns-capability-token".to_owned(),
+                client_url,
+                machine_id,
+                user_id,
+            },
+            1,
+            true,
+        );
+        mgr.handle_run_network_instance(identify, saved.clone(), true)
             .await
             .unwrap();
-        assert!(control.is_read_only() && control.is_no_delete());
-        core_manager
-            .run_network_instance(protected, control)
-            .unwrap();
-
-        let error = mgr
-            .handle_remove_network_instances(identify, vec![running_id, saved_id, protected_id])
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(&protected_id.to_string()));
-        assert!(core_manager.instance(running_id).is_none());
-        assert!(!config_dir.join(format!("{running_id}.toml")).exists());
-        assert!(!config_dir.join(format!("{saved_id}.toml")).exists());
-        assert!(core_manager.instance(protected_id).is_some());
-        assert!(protected_path.is_file());
-        let ids = mgr
-            .handle_list_network_instance_ids(identify)
+        {
+            let mut observed = requests.lock().unwrap();
+            let config = observed.runtime_config.as_mut().unwrap();
+            config.dns = None;
+            config.hostname = Some("observed-before-heartbeat".to_owned());
+        }
+        assert!(session.get_heartbeat_req().await.is_none());
+        let editable = mgr
+            .handle_get_network_config(identify, instance_id)
             .await
             .unwrap();
-        assert!(!ids.disabled_inst_ids.contains(&saved_id.into()));
-        assert!(ids.running_inst_ids.contains(&protected_id.into()));
+        assert_eq!(editable.dns, saved.dns);
+        assert_eq!(
+            editable.hostname.as_deref(),
+            Some("observed-before-heartbeat")
+        );
+        requests.lock().unwrap().runs.clear();
 
-        // The config-only endpoint must enforce the same loader permissions.
-        use easytier::proto::api::manage::RemoveNetworkInstanceConfigRequest;
-        let response = mgr
-            .get_rpc_client(identify)
-            .unwrap()
-            .remove_network_instance_config(
-                Default::default(),
-                RemoveNetworkInstanceConfigRequest {
-                    inst_ids: vec![protected_id.into()],
-
+        let heartbeat_client = rpc
+            .rpc_client()
+            .scoped_client::<WebServerServiceClientFactory<super::BaseController>>(
+                1,
+                1,
+                String::new(),
+            );
+        let runtime_id = uuid::Uuid::new_v4();
+        for (index, supported) in [false, true, false].into_iter().enumerate() {
+            heartbeat_client
+                .heartbeat(
+                    super::BaseController::default(),
+                    HeartbeatRequest {
+                        machine_id: Some(machine_id.into()),
+                        inst_id: Some(runtime_id.into()),
+                        user_token: "dns-capability-token".to_owned(),
+                        report_time: chrono::Local::now().to_rfc3339(),
+                        support_config_source: true,
+                        support_heartbeat_policy: true,
+                        support_manual_routes_patch: true,
+                        support_dns_config_patch: Some(supported),
+                        running_network_instances: vec![instance_id.into()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mgr.handle_validate_config(identify, saved.clone())
+                .await
+                .unwrap();
+            mgr.handle_run_network_instance(identify, saved.clone(), index == 2)
+                .await
+                .unwrap();
+            {
+                let mut observed = requests.lock().unwrap();
+                let config = observed.runtime_config.as_mut().unwrap();
+                config.dns = supported.then(|| easytier::proto::core_config::DnsConfigRaw {
+                    domain: Some("observed.test".to_owned()),
                     ..Default::default()
-                },
-            )
+                });
+            }
+            let (editable, source) = mgr
+                .handle_get_network_config_with_source(identify, instance_id)
+                .await
+                .unwrap();
+            assert_eq!(source, ConfigSource::User);
+            assert_eq!(editable.hostname, saved.hostname);
+            assert_eq!(
+                editable.dns.as_ref().unwrap().domain.as_deref(),
+                Some(if supported {
+                    "observed.test"
+                } else {
+                    "retained.test"
+                })
+            );
+        }
+        let editable = mgr
+            .handle_get_network_config(identify, instance_id)
             .await
             .unwrap();
-        assert_eq!(response.remain_inst_ids, vec![protected_id.into()]);
-        assert!(protected_path.is_file());
-
-        client.shutdown().await;
-        core_manager.retain_network_instances(&[]).await.unwrap();
-        webhook_server.abort();
-        std::fs::remove_dir_all(config_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_config_core_ignores_full_managed_config_reconcile() {
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
-        let mut mgr = ClientManager::new(
-            Db::memory_db().await,
-            None,
-            HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
-            Arc::new(FeatureFlags::default()),
-            webhook_config,
+        assert_eq!(editable, saved);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .runtime_config
+                .as_ref()
+                .unwrap()
+                .dns
+                .is_none()
         );
-        let config_server_addr = add_random_udp_listener(&mut mgr).await;
-        let config_dir = std::env::temp_dir().join(format!(
-            "easytier-web-local-config-full-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
+        mgr.handle_save_network_config(identify, instance_id, editable)
+            .await
+            .unwrap();
+        mgr.handle_update_network_state(identify, instance_id, true)
+            .await
+            .unwrap();
+        mgr.handle_update_network_state(identify, instance_id, false)
+            .await
+            .unwrap();
 
-        let machine_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
-        let core_manager = local_config_instance_manager(config_dir.clone());
-        let client =
-            start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
-        let user_id = wait_for_validated_user(&mgr, machine_id).await;
-        wait_for_local_config_capability(&mgr, user_id, machine_id).await;
-
-        mgr.reconcile_managed_network_configs(
-            user_id,
-            machine_id,
-            vec![managed_config(
-                instance_id,
-                initial_managed_network_config(instance_id),
-            )],
-            Some("local-full".to_string()),
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_no_managed_config_state(&mgr, user_id, machine_id, instance_id).await;
-        assert!(core_manager.instance(instance_id).is_none());
-        assert!(!config_dir.join(format!("{instance_id}.toml")).exists());
-
-        drop(client);
-        webhook_server.abort();
-        std::fs::remove_dir_all(config_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_config_core_ignores_managed_config_patch() {
-        let (webhook_config, webhook_server, _) = test_webhook_config().await;
-        let mut mgr = ClientManager::new(
-            Db::memory_db().await,
-            None,
-            HeartbeatPolicy::from_millis(0, 15_000).unwrap(),
-            Arc::new(FeatureFlags::default()),
-            webhook_config,
+        {
+            let observed = requests.lock().unwrap();
+            assert_eq!(observed.validations.len(), 3);
+            assert_eq!(observed.runs.len(), 4);
+            for index in 0..3 {
+                let target = saved.clone();
+                assert_eq!(observed.validations[index].config, Some(target.clone()));
+                assert_eq!(observed.runs[index].config, Some(target));
+                assert!(observed.runs[index].overwrite);
+                assert!(observed.runs[index].inst_id.is_none());
+            }
+            let restarted = &observed.runs[3];
+            assert_eq!(restarted.config.as_ref().unwrap().dns, saved.dns);
+            assert_eq!(restarted.inst_id.map(uuid::Uuid::from), Some(instance_id));
+            assert!(restarted.overwrite);
+            assert!(observed.runs.iter().all(|request| {
+                request.source == easytier::proto::api::manage::ConfigSource::User as i32
+            }));
+        }
+        let persisted = db
+            .get_network_config(identify, &instance_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted_config: NetworkConfig =
+            serde_json::from_str(&persisted.network_config).unwrap();
+        assert_eq!(persisted_config, saved);
+        assert!(!persisted.disabled);
+        session.stop().await;
+        rpc.stop().await;
+        assert_eq!(
+            mgr.handle_get_network_config(identify, instance_id)
+                .await
+                .unwrap(),
+            saved
         );
-        let config_server_addr = add_random_udp_listener(&mut mgr).await;
-        let config_dir = std::env::temp_dir().join(format!(
-            "easytier-web-local-config-patch-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&config_dir).unwrap();
-
-        let machine_id = uuid::Uuid::new_v4();
-        let instance_id = uuid::Uuid::new_v4();
-        let core_manager = local_config_instance_manager(config_dir.clone());
-        let client =
-            start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
-        let user_id = wait_for_validated_user(&mgr, machine_id).await;
-        wait_for_local_config_capability(&mgr, user_id, machine_id).await;
-
-        mgr.patch_managed_network_configs(
-            user_id,
-            machine_id,
-            vec![managed_config(
-                instance_id,
-                updated_managed_network_config(instance_id),
-            )],
-            Vec::new(),
-            "local-patch".to_string(),
-            "missing-local-base".to_string(),
-        )
-        .await
-        .unwrap();
-
-        assert_no_managed_config_state(&mgr, user_id, machine_id, instance_id).await;
-        assert!(core_manager.instance(instance_id).is_none());
-        assert!(!config_dir.join(format!("{instance_id}.toml")).exists());
-
-        drop(client);
-        webhook_server.abort();
-        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2598,9 +1850,17 @@ mod tests {
             start_web_client_for_test(config_server_addr, machine_id, core_manager.clone()).await;
         let user_id = wait_for_validated_user(&mgr, machine_id).await;
 
-        let desired = updated_managed_network_config(instance_id);
+        let mut desired = updated_managed_network_config(instance_id);
+        desired["dns"] = json!({
+            "domain": "saved.test",
+            "zone": [{
+                "origin": "records.test",
+                "records": [{"name": "info", "type": "TXT", "value": "\"first\" \"second\""}]
+            }]
+        });
         let mut initial = desired.clone();
         initial["port_forwards"] = json!([]);
+        initial["dns"] = json!({"domain": "initial.test"});
         mgr.reconcile_managed_network_configs(
             user_id,
             machine_id,
@@ -2633,6 +1893,23 @@ mod tests {
         .await;
 
         assert_updated_runtime_config(&patched, instance_id);
+        assert_eq!(
+            patched.dns.as_ref().unwrap().domain.as_deref(),
+            Some("saved.test")
+        );
+        assert_eq!(
+            patched
+                .dns
+                .as_ref()
+                .unwrap()
+                .zone
+                .as_ref()
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        wait_for_applied_revision(&mgr, user_id, machine_id, "compact-patched").await;
         assert_eq!(
             mgr.db()
                 .get_managed_config_revision((user_id, machine_id))
@@ -2956,11 +2233,10 @@ mod tests {
         .await
         .unwrap();
 
-        let initial = wait_for_runtime_config(&core_manager, instance_id, |config| {
+        wait_for_runtime_config(&core_manager, instance_id, |config| {
             config.network_name.as_deref() == Some("managed-initial")
         })
         .await;
-        assert_eq!(initial.tld_dns_zone.as_deref(), Some("initial.internal."));
         wait_for_applied_revision(&mgr, user_id, machine_id, "rev-initial").await;
 
         // Runtime-only mutations do not change SQLite. Invalidate the Session
@@ -3077,7 +2353,6 @@ mod tests {
             Some("managed-redelivered")
         );
         assert_eq!(redelivered.enable_kcp_proxy, Some(true));
-        assert_eq!(redelivered.tld_dns_zone, None);
         assert_eq!(redelivered.instance_recv_bps_limit, Some(654321));
         assert_eq!(
             core_manager.config_source(instance_id),
@@ -3113,7 +2388,6 @@ mod tests {
             Some("managed-redelivered")
         );
         assert_eq!(replayed.enable_kcp_proxy, Some(true));
-        assert_eq!(replayed.tld_dns_zone, None);
         assert_eq!(replayed.instance_recv_bps_limit, Some(654321));
 
         core_manager

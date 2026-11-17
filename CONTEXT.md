@@ -112,6 +112,30 @@ data plane. The Cloudflare Adapter is an inbound-only relay hosted by one named
 Durable Object. Their public configuration exposes only capabilities each Host
 can execute; guest ABI details and serialized TOML remain internal.
 
+## UDP FEC
+
+The `peers/conn/fec` Module owns optional connection-local erasure recovery
+for native UDP. Its Interface is the existing handshake feature and the
+`enable_udp_fec` flag; either endpoint can request bidirectional protection
+when both support it. KCP and QUIC proxy packets require their respective
+`enable_udp_fec_kcp` and `enable_udp_fec_quic` flags. Its I/O Adapter encodes
+after the existing send filters and restores before the receive filters.
+The Module owns a bounded sliding coding window, batch deadlines, incremental
+decoding and delivery deduplication. Independent FEC frames share the byte-8
+discriminator position with ordinary peer packets; ordinary packet types
+must stay below 64. UDP sessions remain ordinary transports.
+The Implementation neither interprets inner traffic nor introduces feedback,
+congestion actions or an independent security protocol. See
+[the wire and lifecycle contract](docs/udp-fec-design.md).
+Performance validation separates erasure recovery from congestion: the
+2026-10-29 diagnosis traced TCP variance to pre-rate bursts overflowing a
+128-packet queue. Test-side pacing removed queue loss without changing FEC,
+but does not establish product pacing policy or replace the failed A/B gate.
+Follow-up TUN/UDP accounting found the largest burst already present at TUN;
+the sender path spread it out. This does not isolate receiver recovery or
+ACK feedback, and does not justify changing the coding or repair trigger.
+See the performance evidence and comparison rules in the same design document.
+
 ## Web configuration consumers
 
 Central network management and an external Console are alternative consumers
@@ -164,43 +188,3 @@ members by any console; temporary devices receive a cut-down copy. See
 Device deletion uses the upstream disconnect semantics: an already in-flight
 validation may register the device again. A persisted ban rejects subsequent
 validations. Deletion does not introduce device generations or session fences.
-
-## Subnet exit VPN
-
-One `[vpn]` TOML section (mirrored by `NetworkConfig.vpn`) contains `rules`.
-Each rule assigns one IPv4 or IPv6 destination CIDR to one exit node's virtual
-address. Nonempty rules enable client capture. Matching uses the longest
-prefix; duplicate CIDRs are rejected. Rules sit in front of the official
-`exit_nodes` list in the outbound route lookup: a matching rule uses its exit
-or drops the packet when that exit is unreachable; other destinations follow
-the official exit-node path. Offering exit forwarding is the official
-`flags.enable_exit_node` (default false). Magic DNS and public IPv6 are the
-official implementations; the public IPv6 gateway takes precedence over IPv6
-subnet rules.
-
-`VpnPolicyEngine` (`easytier-core/src/peers/vpn_policy.rs`) owns the compiled
-rules and exit liveness refreshed from peer route snapshots. An unreachable
-exit drops matching captured traffic while its capture routes remain installed.
-A more specific rule never falls back to a broader rule. Mesh destinations,
-known remote proxy subnets, manual mesh routes and local proxy subnets retain
-their existing paths. Exit forwarding uses Linux forwarding/NAT management
-and the existing proxy engines on other platforms.
-
-The host-side route manager (`easytier/src/instance/vpn_routes.rs`)
-captures only configured destinations. Linux uses an instance-specific policy
-table and socket bypass marks; Windows/macOS retain native interface bypass.
-Android projects positive `capture_routes` with `policy_generation`. DNS
-matches ordinary destination rules, and IPv4 rules neither capture nor block
-IPv6 automatically. These guarantees cover traffic entering EasyTier; there
-is no system-wide kill switch. See `docs/vpn-policy.md` for platform and
-migration details.
-
-The management capability is `config:vpn-subnet-exit-v1`; Web/GUI hide the
-VPN section on nodes that do not advertise it.
-
-Attached portal peers inherit their network's VPN configuration through a
-configuration-only subscription. Each peer owns its compiled exclusions and
-exit reachability; sharing a mutable policy engine would mix independent route
-views. The subscription is established before the initial snapshot and is
-cancelled with the attached manager. This does not expand WireGuard AllowedIPs
-or add IPv6 portal ingress.

@@ -24,8 +24,13 @@ const load = async () => {
     }
 };
 onMounted(load);
+// An online device says which settings it can store; batch edits skip the rest.
+const capabilitiesOf = (deviceId: string) => {
+    const device = network.value?.members.find(member => member.device.machine_id === deviceId)?.device;
+    return device?.online ? device.runtime_capabilities ?? [] : undefined;
+};
 const distribution = computed(() => advancedDistribution((members.value ?? []).filter(member => !member.locked)
-    .map(member => member.advanced ?? {})));
+    .map(member => ({ values: member.advanced ?? {}, capabilities: capabilitiesOf(member.device_id) }))));
 const lockedCount = computed(() => members.value?.filter(member => member.locked).length ?? 0);
 const targetCount = computed(() => (members.value?.length ?? 0) - lockedCount.value);
 
@@ -92,9 +97,9 @@ const apply = async () => {
 
 <style scoped>
 .advanced-heading { flex-wrap: wrap; }
-.section-hint { margin: 0; padding: 0 18px 4px; font-size: 13px; color: var(--p-text-muted-color); }
-.advanced-body { padding: 12px 18px 20px; display: flex; flex-direction: column; gap: 12px; }
-.sync-results { display: flex; flex-direction: column; gap: 6px; margin: 8px 18px 0; padding: 12px; border: 1px solid var(--console-border); border-radius: 6px; }
+.section-hint { margin: 0; padding: 0 20px 4px; font-size: 13px; color: var(--p-text-muted-color); }
+.advanced-body { padding: 12px 20px 20px; display: flex; flex-direction: column; gap: 12px; }
+.sync-results { display: flex; flex-direction: column; gap: 6px; margin: 8px 20px 0; padding: 12px; border: 1px solid var(--console-border); border-radius: 6px; }
 .sync-results h3 { margin: 0 0 4px; font-size: 14px; }
 .sync-result { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
 </style>

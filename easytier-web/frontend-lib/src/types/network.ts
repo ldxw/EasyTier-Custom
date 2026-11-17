@@ -1,4 +1,3 @@
-import { VpnConfig as VpnConfigPb } from '../generated/proto/api_manage'
 import { v4 as uuidv4 } from 'uuid'
 import {
   NetworkConfig as NetworkConfigPb,
@@ -10,14 +9,13 @@ import {
   type VpnPortalConfig,
 } from '../generated/proto/api_manage'
 import { ScalarType } from '@protobuf-ts/runtime'
+import { DnsRecordType, type DnsRecordRaw } from '../generated/proto/core_config'
 import type { FlagMeta } from '../generated/proto/annotations'
 import {
   VpnPortalClientState,
   VpnPortalInfo as VpnPortalInfoPb,
-  GetVpnStatusResponse as GetVpnStatusResponsePb,
   type VpnPortalClientInfo,
   type VpnPortalInfo,
-  type GetVpnStatusResponse,
 } from '../generated/proto/api_instance'
 import {
   Action as AclAction,
@@ -42,9 +40,8 @@ import { prepareNetworkConfigForProtoJson } from './networkCompat'
 import { filterConfigPayload, PRIVATE_MODE_DEFAULT_CAPABILITY } from '../modules/capabilities'
 import { canonicalizeP2pDisguisePayload } from '../modules/p2pDisguise'
 
-export { AclAction, AclChainType, AclProtocol, CompressionAlgoPb, NatType, NetworkingMethod }
+export { AclAction, AclChainType, AclProtocol, CompressionAlgoPb, DnsRecordType, NatType, NetworkingMethod }
 export { VpnPortalClientState }
-export type { GetVpnStatusResponse, VpnRuleStatus } from '../generated/proto/api_instance'
 export type { Acl, AclChain, AclRule, AclV1, GroupIdentity, GroupInfo, NetworkPeerConfig, PeerFeatureFlag, PortForwardConfig, SecureModeConfig, VpnPortalClientConfig, VpnPortalClientInfo, VpnPortalConfig, VpnPortalInfo }
 
 export const PEER_PROTOCOLS: { [proto: string]: number } = {
@@ -61,6 +58,18 @@ export const PEER_PROTOCOLS: { [proto: string]: number } = {
   srv: 0,
 }
 
+// Configuration JSON uses transparent repeated wrappers, as Rust Serde does.
+// Derive the value types from the protocol schema rather than copying fields.
+type ConfigJson<T> = T extends { items: Array<infer Item> }
+  ? ConfigJson<Item>[]
+  : T extends DnsRecordRaw
+    ? ConfigJson<Omit<T, 'type'>>
+      & { type: DnsRecordType | keyof typeof DnsRecordType }
+    : T extends object ? { [Key in keyof T]: ConfigJson<T[Key]> } : T
+
+export type DnsConfig = ConfigJson<NonNullable<ProtoNetworkConfig['dns']>>
+export type DnsRecord = ConfigJson<DnsRecordRaw>
+
 export type NetworkConfig = Omit<
   ProtoNetworkConfig,
   | 'instance_id'
@@ -69,8 +78,10 @@ export type NetworkConfig = Omit<
   | 'advanced_sync_at'
   | 'mtu'
   | 'networking_method'
+  | 'dns'
 > & {
   instance_id: string
+  dns?: DnsConfig
   mtu: number | null
   instance_recv_bps_limit: number | string | null
   /// UTC Unix milliseconds of the last core-setting change a console published.
@@ -189,6 +200,7 @@ function newFlagValues(): Record<string, boolean> {
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
   return {
     ...NetworkConfigPb.create(),
+    dns: undefined,
 
     instance_id: uuidv4(),
 
@@ -208,10 +220,10 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
 
     advanced_settings: false,
 
+    // WireGuard is opt-in per device, so the default listens on TCP and UDP only.
     listener_urls: [
       'tcp://0.0.0.0:11010',
       'udp://0.0.0.0:11010',
-      'wg://0.0.0.0:11011',
     ],
     ...newFlagValues(),
     dev_name: '',
@@ -233,7 +245,6 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     network_sync_at: null,
     advanced_sync_at: null,
     mapped_listeners: [],
-    tld_dns_zone: 'et.net.',
     port_forwards: [],
     acl: emptyAcl(),
   }
@@ -385,19 +396,12 @@ function applyNetworkingMethod(
   config.peers = peersFromUrls(config.peer_urls, existingPeers)
 }
 
-function prepareNetworkConfigWithVpn(config: NetworkConfig): NetworkConfig {
-  const prepared = prepareNetworkConfigForProtoJson(config)
-  if (config.vpn) {
-    // Validate before the outer converter discards unknown form-only fields.
-    prepared.vpn = VpnConfigPb.fromJson(config.vpn as any)
-  }
-  return prepared
-}
-
 export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
-  const normalized = NetworkConfigPb.fromJson(prepareNetworkConfigWithVpn(config) as any, {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const normalized = NetworkConfigPb.fromJson(protoConfig as any, {
     ignoreUnknownFields: true,
   }) as unknown as NetworkConfig
+  normalized.dns = dns
 
   applyNetworkingMethod(normalized, { fillPeerUrlsFromPeers: true })
   normalized.mtu = normalizeNumberForInput(normalized.mtu)
@@ -413,9 +417,6 @@ export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
   normalized.exit_nodes ??= []
   normalized.mapped_listeners ??= []
   normalized.port_forwards ??= []
-  if (normalized.vpn) {
-    normalized.vpn.rules ??= []
-  }
   if (normalized.vpn_portal_config) {
     normalized.vpn_portal_config.clients ??= []
     normalized.vpn_portal_config.clients.forEach((client) => {
@@ -438,7 +439,8 @@ export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
 }
 
 export function toBackendNetworkConfig(config: NetworkConfig, capabilities?: readonly string[]): NetworkConfig {
-  const backend = NetworkConfigPb.fromJson(prepareNetworkConfigWithVpn(config) as any, {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const backend = NetworkConfigPb.fromJson(protoConfig as any, {
     ignoreUnknownFields: true,
   })
 
@@ -463,6 +465,7 @@ export function toBackendNetworkConfig(config: NetworkConfig, capabilities?: rea
   const json = NetworkConfigPb.toJson(backend, {
     useProtoFieldName: true,
   }) as unknown as NetworkConfig
+  if (dns !== undefined) json.dns = dns
   if (capabilities === undefined) {
     canonicalizeP2pDisguisePayload(json as unknown as Record<string, unknown>)
     return json
@@ -472,10 +475,6 @@ export function toBackendNetworkConfig(config: NetworkConfig, capabilities?: rea
 
 export function normalizeVpnPortalInfo(info: unknown): VpnPortalInfo {
   return VpnPortalInfoPb.fromJson(info as any, { ignoreUnknownFields: true })
-}
-
-export function normalizeVpnStatus(info: unknown): GetVpnStatusResponse {
-  return GetVpnStatusResponsePb.fromJson(info as any, { ignoreUnknownFields: true })
 }
 
 export interface NetworkInstance {
@@ -600,6 +599,9 @@ export interface PeerConnInfo {
   tunnel?: TunnelInfo
   stats?: PeerConnStats
   loss_rate?: number | string
+  /// Loss of the datagrams carrying the tunnel before FEC repairs any. Only
+  /// tunnels that measure it (HTTP3 with FEC) report it.
+  link_loss_rate?: number | string
 }
 
 export interface PeerRoutePair {
@@ -626,6 +628,9 @@ export interface PeerConnStats {
   estimated_rx_bps?: number | string
   estimated_tx_bps?: number | string
   bandwidth_estimate_version?: number | string
+  /// Traffic rate of the latest sample, in bit/s. Absent from older cores.
+  current_rx_bps?: number | string
+  current_tx_bps?: number | string
 }
 
 export interface CommonUuid {

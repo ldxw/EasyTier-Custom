@@ -2,7 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod elevate;
+mod local_backend;
 mod service_conflicts;
+mod shared_config;
+
+use local_backend::{
+    get_service_status, retire_conflicting_services, set_service_status, stop_local_backend,
+    stop_local_backend_inner,
+};
+
+#[cfg(target_os = "linux")]
+mod linux_tray;
 
 use anyhow::Context;
 use easytier::instance::factory::MobileTunConfig;
@@ -10,15 +20,14 @@ use easytier::instance::factory::MobileTunConfig;
 use easytier::instance::factory::subscribe_native_instance_event;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use easytier::instance::factory::{
-    attach_mobile_tun_fd_with_generation, get_mobile_tun_config as native_mobile_tun_config,
+    attach_mobile_tun_fd, get_mobile_tun_config as native_mobile_tun_config,
 };
 use easytier::proto::api::config::{
     ConfigPatchAction, ConfigRpc, ConfigRpcClientFactory, InstanceConfigPatch, PatchConfigRequest,
     VpnPortalClientPatch,
 };
 use easytier::proto::api::instance::{
-    GetVpnPortalInfoRequest, GetVpnStatusRequest, GetVpnStatusResponse, InstanceIdentifier,
-    PeerManageRpc, PeerManageRpcClientFactory, VpnPortalInfo, VpnPortalRpc,
+    GetVpnPortalInfoRequest, InstanceIdentifier, VpnPortalInfo, VpnPortalRpc,
     VpnPortalRpcClientFactory, instance_identifier,
 };
 use easytier::proto::api::manage::{
@@ -49,6 +58,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 use uuid::Uuid;
 
+use shared_config::{gui_machine_id, restore_managed_configs, shared_config_dir};
 use tauri::{AppHandle, Emitter, Manager as _};
 
 #[cfg(not(target_os = "android"))]
@@ -165,30 +175,6 @@ async fn collect_network_info(instance_id: String) -> Result<CollectNetworkInfoR
 }
 
 #[tauri::command]
-async fn get_vpn_status(instance_id: String) -> Result<Option<GetVpnStatusResponse>, String> {
-    let instance_id = instance_id
-        .parse::<uuid::Uuid>()
-        .map_err(|e| e.to_string())?;
-    let client_manager = get_client_manager!()?;
-    let client = client_manager
-        .rpc_manager
-        .rpc_client()
-        .scoped_client::<PeerManageRpcClientFactory<BaseController>>(1, 1, "".to_string());
-    let response = client
-        .get_vpn_status(
-            BaseController::default(),
-            GetVpnStatusRequest {
-                instance: Some(InstanceIdentifier {
-                    selector: Some(instance_identifier::Selector::Id(instance_id.into())),
-                }),
-            },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(Some(response))
-}
-
-#[tauri::command]
 async fn get_vpn_portal_info(instance_id: String) -> Result<Option<VpnPortalInfo>, String> {
     let instance_id = instance_id
         .parse::<uuid::Uuid>()
@@ -274,34 +260,19 @@ async fn set_logging_level(level: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn set_tun_fd(
-    fd: i32,
-    instance_ids: Option<Vec<Uuid>>,
-    generation: Option<String>,
-) -> Result<MobileTunConfig, String> {
+async fn set_tun_fd(fd: i32, instance_ids: Option<Vec<Uuid>>) -> Result<MobileTunConfig, String> {
     let Some(instance_manager) = INSTANCE_MANAGER.read().await.clone() else {
         return Err("set_tun_fd is not supported in remote mode".to_string());
     };
-    let generation = generation
-        .map(|value| {
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err("TUN generation must be an unsigned decimal integer".to_string());
-            }
-            value.parse::<u64>().map_err(|e| e.to_string())
-        })
-        .transpose()?;
+
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    return attach_mobile_tun_fd_with_generation(
-        instance_manager.as_ref(),
-        fd,
-        instance_ids.as_deref(),
-        generation,
-    )
-    .await
-    .map_err(|error| error.to_string());
+    return attach_mobile_tun_fd(instance_manager.as_ref(), fd, instance_ids.as_deref())
+        .await
+        .map_err(|error| error.to_string());
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = (instance_manager, fd, instance_ids, generation);
+        let _ = (instance_manager, fd, instance_ids);
         Err("mobile TUN attachment is unavailable on this platform".to_owned())
     }
 }
@@ -414,310 +385,8 @@ async fn init_service(app: AppHandle, opts: Option<service::ServiceOptions>) -> 
     Ok(())
 }
 
-#[tauri::command]
-async fn set_service_status(enable: bool, rpc_portal: Option<String>) -> Result<(), String> {
-    let _lifecycle = BACKEND_LIFECYCLE.lock().await;
-    if enable {
-        stop_local_backend_inner().await?;
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        // `ensure_rpc_port_free` binds a socket and `set_status` drives the
-        // SCM (service start/stop can block for seconds) - keep both off the
-        // async threads.
-        tokio::task::spawn_blocking(move || {
-            if enable {
-                let portal = rpc_portal
-                    .as_deref()
-                    .ok_or("RPC portal is required to start the service")?;
-                service_conflicts::ensure_rpc_port_free(portal)
-                    .map_err(|error| format!("{error:#}"))?;
-            }
-            service::set_status(enable).map_err(|e| format!("{:#}", e))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
-    }
-    #[cfg(target_os = "android")]
-    let _ = rpc_portal;
-    Ok(())
-}
-
-#[tauri::command]
-async fn retire_conflicting_services(
-    app: AppHandle,
-    config_dir: String,
-    rpc_portal: Option<String>,
-    allow_uninstall: bool,
-) -> Result<Vec<service_conflicts::RetireOutcome>, String> {
-    let config_dir = shared_config_dir(&app, Some(&config_dir))?;
-    tokio::task::spawn_blocking(move || {
-        service_conflicts::retire_conflicting_services(
-            &config_dir,
-            rpc_portal.as_deref(),
-            allow_uninstall,
-        )
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| format!("{error:#}"))
-}
-
-fn shared_config_dir(
-    app: &AppHandle,
-    configured: Option<&str>,
-) -> Result<std::path::PathBuf, String> {
-    let path = match configured.map(str::trim).filter(|path| !path.is_empty()) {
-        Some(path) => {
-            let path = std::path::PathBuf::from(path);
-            if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map_err(|error| error.to_string())?
-                    .join(path)
-            }
-        }
-        None => {
-            if cfg!(target_os = "android") {
-                app.path()
-                    .app_data_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("network-configs")
-            } else {
-                app.path()
-                    .app_config_dir()
-                    .map_err(|error| error.to_string())?
-                    .join("config.d")
-            }
-        }
-    };
-    std::fs::create_dir_all(&path)
-        .with_context(|| format!("Failed to create config dir {}", path.display()))
-        .map_err(|error| format!("{error:#}"))?;
-    std::fs::canonicalize(&path)
-        .with_context(|| format!("Failed to resolve config dir {}", path.display()))
-        .map_err(|error| format!("{error:#}"))
-}
-
-#[tauri::command]
-fn resolve_shared_config_dir(app: AppHandle, config_dir: Option<String>) -> Result<String, String> {
-    Ok(shared_config_dir(&app, config_dir.as_deref())?
-        .to_string_lossy()
-        .to_string())
-}
-
-fn gui_machine_id(app: &AppHandle) -> Result<Uuid, String> {
-    let state_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    resolve_machine_id(&MachineIdOptions {
-        explicit_machine_id: None,
-        state_dir: Some(state_dir),
-    })
-    .map_err(|error| format!("{error:#}"))
-}
-
-async fn restore_managed_configs(
-    manager: &NativeInstanceManager,
-    state_store: &InstanceStateStore,
-    config_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    // Share the CLI startup policy (see `easytier::instance::config_dir_startup`):
-    // invalid entries and duplicate instance UUIDs are isolated with a
-    // warning so a single broken file cannot keep the whole local backend -
-    // and with it the configuration editor that could repair the file - from
-    // starting. Entries that fail to start are skipped as well.
-    let mut startup =
-        easytier::instance::config_dir_startup::load_config_dir_entries(config_dir, false).await?;
-
-    for file in startup.files.drain(..) {
-        let result = (|| -> anyhow::Result<()> {
-            manager.register_managed_config(file.config.get_id(), file.control.clone())?;
-            if state_store.is_enabled(&file.config.get_id()) {
-                manager.run_network_instance(file.config, file.control)?;
-            }
-            if let Some(contents) = file.original_contents.as_deref() {
-                manager
-                    .local_config_catalog()
-                    .acknowledge_file(&file.path, contents);
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(%error, config_file = ?file.path, "Skipping config directory entry that could not be started");
-        }
-    }
-
-    // Match the service core's discovered defaults and deleted-file cleanup.
-    startup.reconcile_state(state_store);
-    Ok(())
-}
-
 #[cfg(test)]
-mod managed_restore_tests {
-    use super::*;
-
-    #[test]
-    fn normal_mode_accepts_a_saved_service_rpc_address() {
-        let (bind, connect) = normalize_normal_mode_rpc_portal("127.0.0.1:15999").unwrap();
-        assert_eq!(bind.scheme(), "tcp");
-        assert_eq!(bind.host_str(), Some("127.0.0.1"));
-        assert_eq!(bind.port(), Some(15999));
-        assert_eq!(connect, bind);
-    }
-
-    #[test]
-    fn normal_mode_normalizes_wildcard_connect_addrs() {
-        let (bind, connect) = normalize_normal_mode_rpc_portal("0.0.0.0:15999").unwrap();
-        assert_eq!(bind.host_str(), Some("0.0.0.0"));
-        assert_eq!(connect.host_str(), Some("127.0.0.1"));
-
-        let (bind, connect) = normalize_normal_mode_rpc_portal("tcp://[::]:15999").unwrap();
-        assert_eq!(bind.host_str(), Some("[::]"));
-        assert_eq!(connect.host_str(), Some("[::1]"));
-
-        // The GUI never connects out via a wildcard addr; the connect URL
-        // must be dialable.
-        assert!(connect.socket_addrs(|| None).is_ok());
-    }
-
-    #[tokio::test]
-    async fn normal_mode_restores_the_service_config_dir_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let enabled = TomlConfigLoader::default();
-        enabled.set_inst_name("enabled".to_string());
-        enabled.set_listeners(Vec::new());
-        let mut enabled_flags = enabled.get_flags();
-        enabled_flags.no_tun = true;
-        enabled.set_flags(enabled_flags);
-        let enabled_id = enabled.get_id();
-        std::fs::write(
-            dir.path().join(format!("{enabled_id}.toml")),
-            enabled.dump(),
-        )
-        .unwrap();
-
-        let disabled = TomlConfigLoader::default();
-        disabled.set_inst_name("disabled".to_string());
-        disabled.set_listeners(Vec::new());
-        let mut disabled_flags = disabled.get_flags();
-        disabled_flags.no_tun = true;
-        disabled.set_flags(disabled_flags);
-        let disabled_id = disabled.get_id();
-        std::fs::write(dir.path().join("named-disabled.toml"), disabled.dump()).unwrap();
-
-        let stale_id = Uuid::new_v4();
-        let state_store = InstanceStateStore::new(Some(dir.path()));
-        state_store.set_enabled(disabled_id, false).unwrap();
-        state_store.set_enabled(stale_id, false).unwrap();
-        drop(state_store);
-
-        let state_store = InstanceStateStore::new(Some(dir.path()));
-        let manager = native_instance_manager_with_config_dir(Some(dir.path().to_path_buf()));
-        restore_managed_configs(&manager, &state_store, dir.path())
-            .await
-            .unwrap();
-
-        assert!(manager.instance_ids().contains(&enabled_id));
-        assert!(!manager.instance_ids().contains(&disabled_id));
-        assert_eq!(state_store.disabled_instance_ids(), vec![disabled_id]);
-        assert_eq!(
-            manager.managed_config_control(disabled_id).unwrap().path,
-            Some(dir.path().join("named-disabled.toml"))
-        );
-        manager.retain_network_instances(&[]).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn normal_mode_isolates_invalid_config_files() {
-        // The GUI normal mode shares the service config directory, so a
-        // broken file must not keep the whole local backend (and with it the
-        // configuration editor that could repair the file) from starting.
-        let dir = tempfile::tempdir().unwrap();
-        let valid = TomlConfigLoader::default();
-        valid.set_inst_name("valid".to_string());
-        valid.set_listeners(Vec::new());
-        let mut valid_flags = valid.get_flags();
-        valid_flags.no_tun = true;
-        valid.set_flags(valid_flags);
-        let valid_id = valid.get_id();
-        std::fs::write(dir.path().join(format!("{valid_id}.toml")), valid.dump()).unwrap();
-        std::fs::write(dir.path().join("broken.toml"), "not = [a valid toml").unwrap();
-
-        let state_store = InstanceStateStore::new(Some(dir.path()));
-        let manager = native_instance_manager_with_config_dir(Some(dir.path().to_path_buf()));
-        restore_managed_configs(&manager, &state_store, dir.path())
-            .await
-            .unwrap();
-
-        assert!(manager.instance_ids().contains(&valid_id));
-        manager.retain_network_instances(&[]).await.unwrap();
-    }
-}
-
-async fn stop_local_backend_inner() -> Result<(), String> {
-    let manager = INSTANCE_MANAGER.read().await.clone();
-    if let Some(manager) = &manager {
-        manager.local_config_catalog().retire();
-    }
-    let web_clients = std::mem::take(&mut *WEB_CLIENT.write().await);
-    for client in web_clients {
-        client.shutdown().await;
-    }
-    let client = CLIENT_MANAGER.write().await.take();
-    if let Some(client) = client {
-        client.rpc_manager.stop().await;
-    }
-    let server = RPC_SERVER.lock().await.take();
-    if let Some(mut server) = server {
-        server._server.shutdown().await;
-    }
-    if let Some(manager) = manager {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let lock = manager.mutation_lock();
-            let _mutation = lock.lock().await;
-            manager.retain_network_instances(&[]).await
-        })
-        .await
-        .map_err(|_| "Timed out waiting for local network instances to stop".to_string())?
-        .map_err(|error| error.to_string())?;
-    }
-    *INSTANCE_MANAGER.write().await = None;
-    *INSTANCE_STATE_STORE.write().await = None;
-    *INSTANCE_CONFIG_DIR.write().await = None;
-    manager::PREPARED_PROFILES.clear();
-    Ok(())
-}
-
-/// Release the embedded core before a service claims its ports and TUN devices.
-#[tauri::command]
-async fn stop_local_backend() -> Result<(), String> {
-    let _lifecycle = BACKEND_LIFECYCLE.lock().await;
-    stop_local_backend_inner().await
-}
-
-#[tauri::command]
-async fn get_service_status() -> Result<&'static str, String> {
-    #[cfg(not(target_os = "android"))]
-    {
-        use easytier::service_manager::ServiceStatus;
-        let status = tokio::task::spawn_blocking(service::status)
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| format!("{:#}", e))?;
-        match status {
-            ServiceStatus::NotInstalled => Ok("NotInstalled"),
-            ServiceStatus::Stopped(_) => Ok("Stopped"),
-            ServiceStatus::Running => Ok("Running"),
-        }
-    }
-    #[cfg(target_os = "android")]
-    {
-        Ok("NotInstalled")
-    }
-}
+mod managed_restore_tests;
 
 fn normalize_normal_mode_rpc_portal(portal: &str) -> Result<(url::Url, url::Url), String> {
     let portal = if portal.contains("://") {
@@ -1081,373 +750,7 @@ fn check_sudo() -> bool {
     is_elevated
 }
 
-mod manager {
-    use super::*;
-    use async_trait::async_trait;
-    #[cfg(any(test, target_os = "android"))]
-    use easytier::common::config::ConfigSource;
-    use easytier::proto::api::logger::{LoggerRpc, LoggerRpcClientFactory, SetLoggerConfigRequest};
-    use easytier::proto::api::manage::{
-        CollectNetworkInfoRequest, ListNetworkInstanceMetaRequest, ListNetworkInstanceRequest,
-        NetworkMeta, PersistedConfigService, PersistedConfigServiceClientFactory,
-        ValidateConfigRequest,
-    };
-    use easytier::proto::rpc::bidirect::BidirectRpcManager;
-    use easytier::web_client::WebClientHooks;
-    use easytier_core::management::ActiveInstanceForStart;
-
-    /// The settings Android needs to attach a network to its VPN service.
-    #[derive(Clone, serde::Serialize)]
-    pub(super) struct MobileNetworkProfile {
-        no_tun: bool,
-        dhcp: bool,
-        dhcpv6: bool,
-        virtual_ipv4: Option<String>,
-    }
-
-    impl MobileNetworkProfile {
-        pub(super) fn from_config(config: &TomlConfigLoader) -> Result<Self, String> {
-            let config = NetworkConfig::new_from_config(config).map_err(|e| e.to_string())?;
-            Ok(Self {
-                no_tun: config.no_tun.unwrap_or_default(),
-                dhcp: config.dhcp.unwrap_or_default(),
-                dhcpv6: config.dhcpv6.unwrap_or_default(),
-                virtual_ipv4: config.virtual_ipv4,
-            })
-        }
-    }
-
-    /// Profiles of configurations that are about to start. Android prepares
-    /// its VPN service before the instance exists in the manager.
-    pub(super) static PREPARED_PROFILES: once_cell::sync::Lazy<
-        dashmap::DashMap<Uuid, MobileNetworkProfile>,
-    > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
-
-    pub(super) struct GuiHooks {
-        pub(super) app: AppHandle,
-        pub(super) instances: Arc<NativeInstanceManager>,
-    }
-
-    impl GuiHooks {
-        fn notify_vpn_stop_if_no_tun(&self) -> Result<(), String> {
-            let has_tun = self.instances.instance_ids().into_iter().any(|id| {
-                self.instances
-                    .config(id)
-                    .is_some_and(|config| !config.get_flags().no_tun)
-            });
-            if !has_tun {
-                self.app
-                    .emit("vpn_service_stop", "")
-                    .map_err(|error| error.to_string())?;
-            }
-            Ok(())
-        }
-    }
-
-    #[cfg(any(test, target_os = "android"))]
-    fn tun_instances_to_stop(
-        id: Uuid,
-        no_tun: bool,
-        source: ConfigSource,
-        active: &[ActiveInstanceForStart],
-    ) -> Result<Vec<Uuid>, String> {
-        if no_tun {
-            return Ok(Vec::new());
-        }
-        let other_tun = active
-            .iter()
-            .filter(|instance| instance.instance_id != id && !instance.no_tun);
-        if source == ConfigSource::Web
-            && active
-                .iter()
-                .any(|instance| !instance.no_tun && instance.source != ConfigSource::Web)
-        {
-            return Err(
-                "Android only supports one active TUN network; user-managed VPN remains active"
-                    .to_string(),
-            );
-        }
-        Ok(other_tun.map(|instance| instance.instance_id).collect())
-    }
-
-    #[async_trait]
-    impl WebClientHooks for GuiHooks {
-        async fn prepare_start(
-            &self,
-            cfg: &TomlConfigLoader,
-            active: &[ActiveInstanceForStart],
-        ) -> Result<Vec<Uuid>, String> {
-            #[cfg(target_os = "android")]
-            {
-                tun_instances_to_stop(
-                    cfg.get_id(),
-                    cfg.get_flags().no_tun,
-                    cfg.get_network_config_source(),
-                    active,
-                )
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                let _ = (cfg, active);
-                Ok(Vec::new())
-            }
-        }
-
-        async fn pre_run_network_instance(&self, cfg: &TomlConfigLoader) -> Result<(), String> {
-            PREPARED_PROFILES.insert(cfg.get_id(), MobileNetworkProfile::from_config(cfg)?);
-            self.app
-                .emit("pre_run_network_instance", cfg.get_id().to_string())
-                .map_err(|e| e.to_string())
-        }
-
-        async fn post_run_network_instance(&self, instance_id: &uuid::Uuid) -> Result<(), String> {
-            #[cfg(target_os = "android")]
-            if let Some(instance) = self.instances.instance(*instance_id)
-                && let Some(mut receiver) = subscribe_native_instance_event(&instance)
-            {
-                let app = self.app.clone();
-                let id = instance_id.to_string();
-                tokio::spawn(async move {
-                    loop {
-                        let event = match receiver.recv().await {
-                            Ok(
-                                easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Changed(_, _)
-                                | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv4Conflicted(_)
-                                | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Changed(_, _)
-                                | easytier::common::global_ctx::GlobalCtxEvent::DhcpIpv6Conflicted(_),
-                            ) => "dhcp_ip_changed",
-                            Ok(
-                                easytier::common::global_ctx::GlobalCtxEvent::ProxyCidrsUpdated(
-                                    _,
-                                    _,
-                                )
-                                | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6Changed(_, _)
-                                | easytier::common::global_ctx::GlobalCtxEvent::PublicIpv6RoutesUpdated(_, _),
-                            ) => "proxy_cidrs_updated",
-                            Ok(_) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                receiver = receiver.resubscribe();
-                                "event_lagged"
-                            }
-                        };
-                        let _ = app.emit(event, &id);
-                    }
-                });
-            }
-            self.app
-                .emit("post_run_network_instance", instance_id.to_string())
-                .map_err(|e| e.to_string())
-        }
-
-        async fn post_stop_network_instances(&self, ids: &[Uuid]) -> Result<(), String> {
-            for id in ids {
-                PREPARED_PROFILES.remove(id);
-            }
-            self.notify_vpn_stop_if_no_tun()
-        }
-
-        async fn post_remove_network_instances(&self, ids: &[uuid::Uuid]) -> Result<(), String> {
-            for id in ids {
-                PREPARED_PROFILES.remove(id);
-            }
-            self.notify_vpn_stop_if_no_tun()
-        }
-    }
-
-    #[derive(serde::Serialize)]
-    pub(super) struct ListNetworkInstanceIdsResponse {
-        running_inst_ids: Vec<easytier::proto::common::Uuid>,
-        disabled_inst_ids: Vec<easytier::proto::common::Uuid>,
-        runtime_capabilities: Vec<String>,
-    }
-
-    #[derive(serde::Serialize)]
-    pub(super) struct GetNetworkMetasResponse {
-        metas: std::collections::HashMap<Uuid, NetworkMeta>,
-    }
-
-    /// RPC connection to the Core whose config directory the GUI manages.
-    pub(super) struct GUIClientManager {
-        pub(super) rpc_manager: BidirectRpcManager,
-        pub(super) config_mutation: Mutex<()>,
-    }
-
-    impl GUIClientManager {
-        pub async fn new(
-            rpc_url: Option<String>,
-            local_process_runtime: Option<Arc<CoreProcessRuntime>>,
-        ) -> Result<Self, anyhow::Error> {
-            let tunnel = if let Some(url) = rpc_url {
-                runtime_rpc_dialer(url.parse()?).connect().await?
-            } else {
-                local_process_runtime
-                    .context("local RPC requires a core process runtime")?
-                    .connect_ring_tunnel(*RPC_RING_UUID.deref())?
-            };
-            let rpc_manager = BidirectRpcManager::new();
-            rpc_manager.run_with_tunnel(tunnel);
-            Ok(Self {
-                rpc_manager,
-                config_mutation: Mutex::new(()),
-            })
-        }
-
-        pub(super) fn web_client(
-            &self,
-        ) -> Box<dyn WebClientService<Controller = BaseController> + Send + Sync> {
-            self.rpc_manager
-                .rpc_client()
-                .scoped_client::<WebClientServiceClientFactory<BaseController>>(1, 1, String::new())
-        }
-
-        pub(super) fn persisted_configs(
-            &self,
-        ) -> Box<dyn PersistedConfigService<Controller = BaseController> + Send + Sync> {
-            self.rpc_manager
-                .rpc_client()
-                .scoped_client::<PersistedConfigServiceClientFactory<BaseController>>(
-                    1,
-                    1,
-                    String::new(),
-                )
-        }
-
-        pub(super) fn config_rpc(
-            &self,
-        ) -> Box<dyn ConfigRpc<Controller = BaseController> + Send + Sync> {
-            self.rpc_manager
-                .rpc_client()
-                .scoped_client::<ConfigRpcClientFactory<BaseController>>(1, 1, String::new())
-        }
-
-        fn logger_rpc(&self) -> Box<dyn LoggerRpc<Controller = BaseController> + Send + Sync> {
-            self.rpc_manager
-                .rpc_client()
-                .scoped_client::<LoggerRpcClientFactory<BaseController>>(1, 1, String::new())
-        }
-
-        pub(super) async fn set_logging_level(&self, level: String) -> Result<(), anyhow::Error> {
-            self.logger_rpc()
-                .set_logger_config(
-                    BaseController::default(),
-                    SetLoggerConfigRequest {
-                        level: easytier_core::management::parse_log_level(&level).into(),
-                    },
-                )
-                .await?;
-            Ok(())
-        }
-
-        pub(super) async fn list_network_instance_ids(
-            &self,
-        ) -> anyhow::Result<ListNetworkInstanceIdsResponse> {
-            let response = self
-                .web_client()
-                .list_network_instance(BaseController::default(), ListNetworkInstanceRequest {})
-                .await?;
-            Ok(ListNetworkInstanceIdsResponse {
-                running_inst_ids: response.inst_ids,
-                disabled_inst_ids: response.disabled_inst_ids,
-                runtime_capabilities: response.runtime_capabilities,
-            })
-        }
-
-        pub(super) async fn collect_network_info(
-            &self,
-            instance_id: Uuid,
-        ) -> anyhow::Result<CollectNetworkInfoResponse> {
-            Ok(self
-                .web_client()
-                .collect_network_info(
-                    BaseController::default(),
-                    CollectNetworkInfoRequest {
-                        inst_ids: vec![instance_id.into()],
-                    },
-                )
-                .await?)
-        }
-
-        pub(super) async fn validate_config(
-            &self,
-            config: NetworkConfig,
-        ) -> anyhow::Result<ValidateConfigResponse> {
-            Ok(self
-                .web_client()
-                .validate_config(
-                    BaseController::default(),
-                    ValidateConfigRequest {
-                        config: Some(config),
-                    },
-                )
-                .await?)
-        }
-
-        pub(super) async fn get_network_metas(
-            &self,
-            instance_ids: Vec<Uuid>,
-        ) -> anyhow::Result<GetNetworkMetasResponse> {
-            let response = self
-                .web_client()
-                .list_network_instance_meta(
-                    BaseController::default(),
-                    ListNetworkInstanceMetaRequest {
-                        inst_ids: instance_ids.into_iter().map(Into::into).collect(),
-                    },
-                )
-                .await?;
-            Ok(GetNetworkMetasResponse {
-                metas: response
-                    .metas
-                    .into_iter()
-                    .filter_map(|meta| Some((meta.inst_id?.into(), meta)))
-                    .collect(),
-            })
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn android_start_plans_are_pure_and_preserve_user_tun_ownership() {
-            let id = Uuid::new_v4();
-            let user = Uuid::new_v4();
-            let web = Uuid::new_v4();
-            let active = [
-                ActiveInstanceForStart {
-                    instance_id: user,
-                    no_tun: false,
-                    source: ConfigSource::User,
-                },
-                ActiveInstanceForStart {
-                    instance_id: web,
-                    no_tun: false,
-                    source: ConfigSource::Web,
-                },
-            ];
-            assert_eq!(
-                tun_instances_to_stop(id, true, ConfigSource::User, &active).unwrap(),
-                Vec::<Uuid>::new()
-            );
-            assert_eq!(
-                tun_instances_to_stop(id, false, ConfigSource::User, &active).unwrap(),
-                vec![user, web]
-            );
-            assert!(tun_instances_to_stop(id, false, ConfigSource::Web, &active).is_err());
-            assert!(tun_instances_to_stop(user, false, ConfigSource::Web, &active).is_err());
-            assert_eq!(
-                tun_instances_to_stop(web, false, ConfigSource::Web, &active[1..]).unwrap(),
-                Vec::<Uuid>::new()
-            );
-            assert_eq!(
-                tun_instances_to_stop(id, false, ConfigSource::Web, &active[1..]).unwrap(),
-                vec![web]
-            );
-        }
-    }
-}
+mod manager;
 
 #[cfg(not(target_os = "android"))]
 mod service {
@@ -1588,8 +891,46 @@ mod service {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum UserTrayUpdate {
+    Menu { show: String, quit: String },
+    RunState { running: bool },
+    Tooltip { tooltip: String },
+}
+
+#[tauri::command]
+fn update_user_tray(update: UserTrayUpdate) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_tray::update(update).map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = update;
+        Err("The tray is managed by this GUI process".to_string())
+    }
+}
+
+#[tauri::command]
+fn uses_user_tray() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_tray::is_controlled()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run_gui() -> std::process::ExitCode {
+    #[cfg(target_os = "linux")]
+    if !elevate::Command::is_elevated() {
+        return linux_tray::run();
+    }
+
     #[cfg(not(target_os = "android"))]
     if !check_sudo() {
         use std::process;
@@ -1603,14 +944,18 @@ pub fn run_gui() -> std::process::ExitCode {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            app.webview_windows()
-                .values()
-                .next()
-                .expect("Sorry, no window found")
-                .set_focus()
-                .expect("Can't Bring Window to Focus");
-        }));
+        // The user-session tray already enforces a single GUI instance.
+        // Its elevated child must not compete for the same D-Bus name.
+        if !uses_user_tray() {
+            builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                app.webview_windows()
+                    .values()
+                    .next()
+                    .expect("Sorry, no window found")
+                    .set_focus()
+                    .expect("Can't Bring Window to Focus");
+            }));
+        }
     }
 
     builder = builder
@@ -1622,6 +967,11 @@ pub fn run_gui() -> std::process::ExitCode {
 
     let app = builder
         .setup(|app| {
+            #[cfg(target_os = "linux")]
+            if linux_tray::is_controlled() {
+                linux_tray::listen(app.handle().clone())?;
+            }
+
             // for logging config
             let Ok(log_dir) = get_log_dir(app.app_handle()) else {
                 return Ok(());
@@ -1641,24 +991,26 @@ pub fn run_gui() -> std::process::ExitCode {
 
             // for tray icon, menu need to be built in js
             #[cfg(not(target_os = "android"))]
-            let _tray_menu = TrayIconBuilder::with_id("main")
-                .show_menu_on_left_click(false)
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        toggle_window_visibility(app);
-                    }
-                })
-                .icon(tauri::image::Image::from_bytes(include_bytes!(
-                    "../icons/icon.png"
-                ))?)
-                .icon_as_template(true)
-                .build(app)?;
+            if !uses_user_tray() {
+                let _tray_menu = TrayIconBuilder::with_id("main")
+                    .show_menu_on_left_click(false)
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            toggle_window_visibility(app);
+                        }
+                    })
+                    .icon(tauri::image::Image::from_bytes(include_bytes!(
+                        "../icons/icon.png"
+                    ))?)
+                    .icon_as_template(true)
+                    .build(app)?;
+            }
 
             Ok(())
         })
@@ -1670,7 +1022,6 @@ pub fn run_gui() -> std::process::ExitCode {
             parse_network_config,
             generate_network_config,
             collect_network_info,
-            get_vpn_status,
             get_vpn_portal_info,
             patch_vpn_portal_clients,
             set_logging_level,
@@ -1683,7 +1034,7 @@ pub fn run_gui() -> std::process::ExitCode {
             mobile_network_profile,
             get_network_metas,
             init_service,
-            resolve_shared_config_dir,
+            shared_config::resolve_shared_config_dir,
             stop_local_backend,
             set_service_status,
             retire_conflicting_services,
@@ -1693,6 +1044,8 @@ pub fn run_gui() -> std::process::ExitCode {
             init_web_client,
             is_web_client_connected,
             get_log_dir_path,
+            uses_user_tray,
+            update_user_tray,
         ])
         .on_window_event(|_win, event| match event {
             #[cfg(not(target_os = "android"))]

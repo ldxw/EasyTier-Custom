@@ -96,15 +96,24 @@ pub(crate) fn set_network_flags(result: &mut NetworkConfig, flags: FlagsPatch) {
     result.disable_relay_data = flags.disable_relay_data;
     result.prefer_peer_relay = flags.prefer_peer_relay;
     result.enable_udp_broadcast_relay = flags.enable_udp_broadcast_relay;
+    result.enable_udp_fec = flags.enable_udp_fec;
+    result.enable_udp_fec_kcp = flags.enable_udp_fec_kcp;
+    result.enable_udp_fec_quic = flags.enable_udp_fec_quic;
     result.disable_sym_hole_punching = flags.disable_sym_hole_punching;
     result.enable_magic_dns = flags.accept_dns;
+    #[allow(deprecated)]
+    {
+        result.tld_dns_zone = flags.tld_dns_zone;
+    }
     result.p2p_disguise_mode = flags
         .p2p_disguise_mode
         .filter(|mode| !mode.trim().is_empty())
         .map(|mode| mode.trim().to_ascii_lowercase());
     result.p2p_prefer_protocol = flags.default_protocol;
     result.close_redundant_conns_when_disguised = flags.close_redundant_conns_when_disguised;
-    result.tld_dns_zone = flags.tld_dns_zone;
+    result.http3_fec_ratio = flags.http3_fec_ratio;
+    result.http3_streams = flags.http3_streams;
+    result.disable_http3_fec = flags.enable_http3_fec.map(|enabled| !enabled);
     result.mtu = flags.mtu.map(|mtu| mtu as i32);
     result.data_compress_algo = flags.data_compress_algo;
     result.encryption_algorithm = flags.encryption_algorithm;
@@ -133,6 +142,7 @@ pub trait NetworkConfigExt {
 ))]
 const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
     "hostname",
+    "dns",
     "sni",
     "parallel_connections",
     "disable_parallel_connections",
@@ -145,7 +155,6 @@ const FORM_MANAGED_TOML_FIELDS: &[&str] = &[
     "ipv6_public_addr_provider",
     "ipv6_public_addr_auto",
     "ipv6_public_addr_prefix",
-    "vpn",
     "dhcp",
     "dhcpv6",
     "network_identity",
@@ -268,7 +277,11 @@ fn parse_peer_urls(peer_urls: &[String]) -> Result<Vec<PeerConfig>, anyhow::Erro
 impl NetworkConfigExt for NetworkConfig {
     #[allow(deprecated)]
     fn gen_config(&self) -> Result<TomlConfigLoader, anyhow::Error> {
+        if let Some(dns) = &self.dns {
+            super::dns::compile_dns(dns)?;
+        }
         let cfg = TomlConfigLoader::default();
+        cfg.set_dns(self.dns.clone());
         cfg.set_id(
             self.instance_id
                 .clone()
@@ -496,30 +509,6 @@ impl NetworkConfigExt for NetworkConfig {
             cfg.set_exit_nodes(exit_nodes);
         }
 
-        if let Some(vpn) = self.vpn.as_ref() {
-            let vpn = crate::config::vpn::pb::from_pb(vpn.clone())
-                .map_err(|error| anyhow::anyhow!("{error}"))?;
-            cfg.set_vpn(vpn);
-        }
-
-        if let Some(ipv6_public_addr_provider) = self.ipv6_public_addr_provider {
-            cfg.set_ipv6_public_addr_provider(ipv6_public_addr_provider);
-        }
-
-        if let Some(ipv6_public_addr_auto) = self.ipv6_public_addr_auto {
-            cfg.set_ipv6_public_addr_auto(ipv6_public_addr_auto);
-        }
-
-        if let Some(ipv6_public_addr_prefix) = self
-            .ipv6_public_addr_prefix
-            .as_ref()
-            .filter(|prefix| !prefix.is_empty())
-        {
-            cfg.set_ipv6_public_addr_prefix(Some(ipv6_public_addr_prefix.parse().with_context(
-                || format!("failed to parse ipv6 public address prefix: {ipv6_public_addr_prefix}"),
-            )?));
-        }
-
         if self.enable_socks5.unwrap_or_default()
             && let Some(socks5_port) = self.socks5_port
         {
@@ -565,6 +554,24 @@ impl NetworkConfigExt for NetworkConfig {
             );
         }
 
+        if let Some(ipv6_public_addr_provider) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(ipv6_public_addr_provider);
+        }
+
+        if let Some(ipv6_public_addr_auto) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(ipv6_public_addr_auto);
+        }
+
+        if let Some(ipv6_public_addr_prefix) = self
+            .ipv6_public_addr_prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            cfg.set_ipv6_public_addr_prefix(Some(ipv6_public_addr_prefix.parse().with_context(
+                || format!("failed to parse ipv6 public address prefix: {ipv6_public_addr_prefix}"),
+            )?));
+        }
+
         if let Some(acl) = self.acl.as_ref()
             && !acl.is_empty()
         {
@@ -592,6 +599,7 @@ impl NetworkConfigExt for NetworkConfig {
                 }
             }),
             accept_dns: self.enable_magic_dns,
+            #[allow(deprecated)]
             tld_dns_zone: self.tld_dns_zone.clone(),
             mtu: self
                 .mtu
@@ -623,9 +631,30 @@ impl NetworkConfigExt for NetworkConfig {
             disable_relay_data: self.disable_relay_data,
             prefer_peer_relay: self.prefer_peer_relay,
             enable_udp_broadcast_relay: self.enable_udp_broadcast_relay,
+            enable_udp_fec: self.enable_udp_fec,
+            enable_udp_fec_kcp: self.enable_udp_fec_kcp,
+            enable_udp_fec_quic: self.enable_udp_fec_quic,
             disable_sym_hole_punching: self.disable_sym_hole_punching,
             p2p_disguise_mode: self.p2p_disguise_mode.clone(),
             close_redundant_conns_when_disguised: self.close_redundant_conns_when_disguised,
+            http3_fec_ratio: self
+                .http3_fec_ratio
+                .map(|ratio| {
+                    anyhow::ensure!(ratio <= 100, "invalid http3_fec_ratio: expected 0..=100");
+                    Ok(ratio)
+                })
+                .transpose()?,
+            enable_http3_fec: self.disable_http3_fec.map(|disabled| !disabled),
+            http3_streams: self
+                .http3_streams
+                .map(|streams| {
+                    anyhow::ensure!(
+                        (1..=32).contains(&streams),
+                        "invalid http3_streams: expected 1..=32"
+                    );
+                    Ok(streams)
+                })
+                .transpose()?,
             instance_recv_bps_limit: self.instance_recv_bps_limit,
             ..Default::default()
         });
@@ -641,6 +670,7 @@ impl NetworkConfigExt for NetworkConfig {
             ..Default::default()
         };
 
+        result.dns = config.get_dns();
         result.instance_id = Some(config.get_id().to_string());
         if config.get_hostname() != default_config.get_hostname() {
             result.hostname = Some(config.get_hostname());
@@ -688,11 +718,6 @@ impl NetworkConfigExt for NetworkConfig {
         result.ipv6_public_addr_prefix = config
             .get_ipv6_public_addr_prefix()
             .map(|prefix| prefix.to_string());
-
-        let vpn = config.get_vpn();
-        if vpn != default_config.get_vpn() {
-            result.vpn = Some(crate::config::vpn::pb::to_pb(&vpn));
-        }
 
         let peers = config.get_peers();
         result.networking_method = Some(NetworkingMethod::Manual as i32);
@@ -800,6 +825,193 @@ mod tests {
     use super::*;
     use easytier_proto::common::Flags;
 
+    #[cfg(test)]
+    mod custom_tests;
+
+    #[test]
+    fn dns_records_survive_toml_and_form_edits() {
+        for dns in [
+            "",
+            "[dns]\n",
+            "[dns]\ndomain = 'mesh.test.'\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nttl = 0\nrecords = [{ name = 'nas', type = 'A', value = '10.0.0.8' }, { name = 'nas', type = 'AAAA', value = 'fd00::8' }]\n",
+        ] {
+            let config = TomlConfigLoader::new_from_str(dns).unwrap();
+            let expected = config.get_dns();
+            config.set_hostname(Some("changed".to_owned()));
+            assert_eq!(config.get_dns(), expected);
+            #[cfg(feature = "config-write")]
+            assert_eq!(
+                TomlConfigLoader::new_from_str(&config.dump())
+                    .unwrap()
+                    .get_dns(),
+                expected
+            );
+            #[cfg(feature = "browser-config")]
+            {
+                let api = NetworkConfig::new_from_config(&config).unwrap();
+                let merged = merge_network_config_toml(dns, &api).unwrap();
+                let restored = TomlConfigLoader::new_from_str(&merged).unwrap();
+                assert_eq!(restored.get_dns(), expected);
+                assert_eq!(restored.get_hostname(), "changed");
+            }
+        }
+    }
+
+    #[cfg(feature = "browser-config")]
+    #[test]
+    fn dns_raw_presence_survives_management_json_and_file_roundtrips() {
+        for input in [
+            "",
+            "[dns]\n",
+            "[dns]\ndomain = 'mesh.test.'\n",
+            "[dns]\nzone = []\n",
+            "[[dns.zone]]\norigin = 'example.test.'\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nttl = 0\nrecords = []\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = [{ name = '@', type = 'A', value = '192.0.2.1' }]\n",
+            r#"[[dns.zone]]
+origin = 'example.test.'
+ttl = 60
+records = [
+    { name = '@', type = 'MX', value = '10 mail' },
+    { name = 'info', type = 'TXT', ttl = 0, value = '"quote\" slash\\ ;" "" "tail"' },
+]
+"#,
+        ] {
+            let config = TomlConfigLoader::new_from_str(input).unwrap();
+            let expected = config.get_dns();
+            let network = NetworkConfig::new_from_config(&config).unwrap();
+            assert_eq!(network.dns, expected, "{input}");
+            let json = serde_json::to_value(&network).unwrap();
+            if let Some(records) = expected.as_ref().and_then(|dns| dns.zone.as_ref()) {
+                assert_eq!(
+                    json["dns"]["zone"].as_array().unwrap().len(),
+                    records.items.len()
+                );
+            }
+            if let Some(domain) = expected.as_ref().and_then(|dns| dns.domain.as_deref()) {
+                assert_eq!(json["dns"]["domain"].as_str(), Some(domain));
+            }
+            let network: NetworkConfig = serde_json::from_value(json).unwrap();
+            let restored = network.gen_config().unwrap();
+            assert_eq!(restored.get_dns(), expected, "{input}");
+            assert_eq!(
+                TomlConfigLoader::new_from_str(&restored.dump())
+                    .unwrap()
+                    .get_dns(),
+                expected
+            );
+            let merged = merge_network_config_toml(input, &network).unwrap();
+            assert_eq!(
+                TomlConfigLoader::new_from_str(&merged).unwrap().get_dns(),
+                expected
+            );
+            #[cfg(feature = "web-client")]
+            assert_eq!(
+                crate::config::api::network_config_from_toml(&config).dns,
+                expected
+            );
+        }
+        let missing = TomlConfigLoader::new_from_str("[dns]\n")
+            .unwrap()
+            .get_dns()
+            .unwrap();
+        let empty = TomlConfigLoader::new_from_str("[dns]\nzone = []\n")
+            .unwrap()
+            .get_dns()
+            .unwrap();
+        assert!(missing.zone.is_none());
+        assert!(empty.zone.unwrap().items.is_empty());
+
+        let input = "[[dns.zone]]\norigin = 'example.test.'\nrecords = []\n";
+        let mut network =
+            NetworkConfig::new_from_config(TomlConfigLoader::new_from_str(input).unwrap()).unwrap();
+        network.dns = None;
+        let cleared = merge_network_config_toml(input, &network).unwrap();
+        assert!(
+            TomlConfigLoader::new_from_str(&cleared)
+                .unwrap()
+                .get_dns()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dns_file_input_rejects_unknown_fields_and_invalid_shapes() {
+        for input in [
+            "[dns]\nzoen = []\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecrods = []\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = {}\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nttl = -1\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = [{ name = '@', type = 'A', value = '192.0.2.1', txt = { segments = ['x'] } }]\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = [{ name = '@', type = 'UNKNOWN', value = 'x' }]\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = [{ name = '@', type = 'TXT', value = '' }]\n",
+            "[[dns.zone]]\norigin = 'example.test.'\nrecords = ['@ IN A 192.0.2.1']\n",
+        ] {
+            assert!(
+                TomlConfigLoader::new_from_str(input).is_err(),
+                "accepted {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_alpn_errors_use_file_and_management_field_paths() {
+        let long_alpn = format!("1 . \"alpn=a ( {})\"", "b ".repeat(1500));
+        for kind in ["HTTPS", "SVCB"] {
+            for (value, valid) in [
+                ("1 . alpn=,", false),
+                ("1 . alpn=h2,,h3", false),
+                (r#"1 . alpn="h2,,h3""#, false),
+                (r"1 . alpn=\@,h2", false),
+                (r"1 . alpn=\(h2", false),
+                (r"1 . alpn=\$TTL", false),
+                (r#"1 . "alpn=;h2""#, false),
+                (r#"1 . "alpn= h2""#, false),
+                (r#"1 . alpn=\"unterminated"#, false),
+                ("1 . alpn=\\\"\\\\\u{0663}ab\\\"", false),
+                ("1 . alpn=\"\\\"\\\\\u{0663}ab\\\"\"", false),
+                ("1 . alpn=\"", false),
+                ("1 . port=\"", false),
+                (r#"1 target key65400="unterminated"#, false),
+                (r#"1 target key65400="tail\""#, false),
+                ("1 target alpn=h2,h3 port=443", true),
+                ("1 target alpn=h\u{0663} port=443", true),
+                (r#"1 target alpn="h2,h3" port=443"#, true),
+                (r#"1 target alpn="f\\\\oo\,bar,h2" port=443"#, true),
+                (r"1 target alpn=\, port=443", true),
+                ("1 target alpn=h2, port=443", true),
+                (long_alpn.as_str(), true),
+                (r#"1 target key65400="complete""#, true),
+                (r#"1 target key65400="tail\\""#, true),
+            ] {
+                let network: NetworkConfig = serde_json::from_value(serde_json::json!({
+                    "networking_method": NetworkingMethod::Standalone as i32,
+                    "dns": { "zone": [{
+                        "origin": "example.test.",
+                        "records": [{ "name": "svc", "type": kind, "value": value }]
+                    }] }
+                }))
+                .unwrap();
+                let file = format!(
+                    "[[dns.zone]]\norigin = 'example.test.'\nrecords = [\
+                     {{ name = 'svc', type = '{kind}', value = '{value}' }}]\n"
+                );
+                for result in [network.gen_config(), TomlConfigLoader::new_from_str(&file)] {
+                    if valid {
+                        assert!(result.is_ok(), "{kind} {value}: {result:?}");
+                    } else {
+                        let error = result.unwrap_err().to_string();
+                        assert!(
+                            error.contains("dns.zone[0].records[0].value"),
+                            "{kind} {value}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn api_portal_config() -> manage::VpnPortalConfig {
         manage::VpnPortalConfig {
             enabled: None,
@@ -818,104 +1030,6 @@ mod tests {
             networking_method: Some(NetworkingMethod::Standalone as i32),
             ..Default::default()
         }
-    }
-
-    fn port_forward(
-        bind_ip: &str,
-        bind_port: u32,
-        dst_ip: &str,
-        dst_port: u32,
-    ) -> manage::PortForwardConfig {
-        manage::PortForwardConfig {
-            bind_ip: bind_ip.to_owned(),
-            bind_port,
-            dst_ip: dst_ip.to_owned(),
-            dst_port,
-            proto: "tcp".to_owned(),
-        }
-    }
-
-    #[test]
-    fn port_forwards_parse_ip_and_port_separately_and_survive_ipv6() {
-        let mut config = standalone_config();
-        config.port_forwards = vec![
-            port_forward("10.0.0.1", 8080, "192.168.1.2", 80),
-            port_forward("fe80::1", 8080, "2001:db8::1", 443),
-        ];
-        let forwards = config.gen_config().unwrap().get_port_forwards();
-        assert_eq!(forwards.len(), 2);
-        assert_eq!(forwards[0].bind_addr.to_string(), "10.0.0.1:8080");
-        assert_eq!(forwards[1].bind_addr.to_string(), "[fe80::1]:8080");
-        assert_eq!(forwards[1].dst_addr.to_string(), "[2001:db8::1]:443");
-        assert_eq!(forwards[1].proto, "tcp");
-    }
-
-    #[test]
-    fn blank_port_forward_rows_are_skipped_but_invalid_rules_error() {
-        let mut config = standalone_config();
-        config.port_forwards = vec![
-            manage::PortForwardConfig::default(),
-            port_forward("10.0.0.1", 8080, "192.168.1.2", 80),
-        ];
-        assert_eq!(config.gen_config().unwrap().get_port_forwards().len(), 1);
-
-        let mut config = standalone_config();
-        config.port_forwards = vec![port_forward("999.0.0.1", 8080, "192.168.1.2", 80)];
-        let error = config.gen_config().unwrap_err().to_string();
-        assert!(error.contains("not a valid IP address"), "{error}");
-
-        let mut config = standalone_config();
-        config.port_forwards = vec![port_forward("10.0.0.1", 70000, "192.168.1.2", 80)];
-        let error = config.gen_config().unwrap_err().to_string();
-        assert!(error.contains("between 0 and 65535"), "{error}");
-
-        // Port 0 binds an OS-assigned port and must stay legal.
-        let mut config = standalone_config();
-        config.port_forwards = vec![port_forward("127.0.0.1", 0, "10.88.0.8", 80)];
-        let forwards = config.gen_config().unwrap().get_port_forwards();
-        assert_eq!(forwards.len(), 1);
-        assert_eq!(forwards[0].bind_addr.to_string(), "127.0.0.1:0");
-
-        let mut config = standalone_config();
-        let mut rule = port_forward("10.0.0.1", 8080, "192.168.1.2", 80);
-        rule.proto = "sctp".to_owned();
-        config.port_forwards = vec![rule];
-        assert!(config.gen_config().is_err());
-    }
-
-    #[test]
-    fn gen_config_rejects_unknown_disguise_modes() {
-        let mut config = standalone_config();
-        config.p2p_disguise_mode = Some("disable".into());
-        let error = config.gen_config().unwrap_err().to_string();
-        assert!(error.contains("p2p_disguise_mode"), "{error}");
-    }
-
-    #[test]
-    fn port_forward_read_back_round_trip_preserves_ipv6_rules() {
-        let mut config = standalone_config();
-        config.port_forwards = vec![port_forward("fe80::1", 8080, "2001:db8::1", 443)];
-        let forwards = config.gen_config().unwrap().get_port_forwards();
-
-        // The management read-back path serializes the address and port as
-        // separate fields, so an IPv6 rule must survive a save/load cycle.
-        let round_tripped = NetworkConfig {
-            port_forwards: forwards
-                .iter()
-                .map(|f| manage::PortForwardConfig {
-                    proto: f.proto.clone(),
-                    bind_ip: f.bind_addr.ip().to_string(),
-                    bind_port: f.bind_addr.port() as u32,
-                    dst_ip: f.dst_addr.ip().to_string(),
-                    dst_port: f.dst_addr.port() as u32,
-                })
-                .collect(),
-            ..standalone_config()
-        };
-        let forwards = round_tripped.gen_config().unwrap().get_port_forwards();
-        assert_eq!(forwards.len(), 1);
-        assert_eq!(forwards[0].bind_addr.to_string(), "[fe80::1]:8080");
-        assert_eq!(forwards[0].dst_addr.to_string(), "[2001:db8::1]:443");
     }
 
     /// The management API's name for a flag is the schema's to state, and the
@@ -992,73 +1106,6 @@ mod tests {
 
     #[cfg(feature = "config-write")]
     #[test]
-    fn web_form_omits_defaults_without_changing_effective_flags() {
-        let mut input = standalone_config();
-        set_network_flags(&mut input, Flags::defaults().downgrade());
-        input.vpn = Some(manage::VpnConfig { rules: vec![] });
-        input.hostname = Some(String::new());
-        input.secure_mode = Some(Default::default());
-
-        let generated = input.gen_config().unwrap();
-        let document: toml::Table = toml::from_str(&generated.dump()).unwrap();
-        for field in ["flags", "vpn", "hostname", "secure_mode", "dhcp"] {
-            assert!(
-                !document.contains_key(field),
-                "default {field} should be omitted"
-            );
-        }
-        let restored = TomlConfigLoader::new_from_str(&generated.dump()).unwrap();
-        assert_eq!(restored.get_flags(), Flags::defaults());
-        assert!(restored.get_flags().private_mode);
-        assert!(!restored.get_flags().enable_exit_node);
-
-        input.enable_private_mode = Some(false);
-        input.disable_encryption = Some(true);
-        input.socket_mark = Some(0);
-        input.instance_recv_bps_limit = Some(0);
-        input.enable_exit_node = Some(true);
-        let generated = input.gen_config().unwrap();
-        let document: toml::Table = toml::from_str(&generated.dump()).unwrap();
-        assert_eq!(document["flags"]["private_mode"].as_bool(), Some(false));
-        assert_eq!(
-            document["flags"]["enable_encryption"].as_bool(),
-            Some(false)
-        );
-        assert_eq!(document["flags"]["socket_mark"].as_integer(), Some(0));
-        assert_eq!(document["flags"]["enable_exit_node"].as_bool(), Some(true));
-        assert!(!document.contains_key("vpn"));
-        assert!(generated.get_flags().enable_exit_node);
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn p2p_mode_is_the_single_saved_policy_parameter() {
-        for mode in ["prefer", "off", "disabled", "only"] {
-            let input = NetworkConfig {
-                p2p_disguise_mode: Some(mode.to_owned()),
-                ..standalone_config()
-            };
-            let generated = input.gen_config().unwrap();
-            let document: toml::Table = toml::from_str(&generated.dump()).unwrap();
-            let flags = document.get("flags").and_then(toml::Value::as_table);
-            if mode == "prefer" {
-                assert!(flags.is_none());
-            } else {
-                assert_eq!(flags.unwrap().len(), 1);
-                assert_eq!(flags.unwrap()["p2p_disguise_mode"].as_str(), Some(mode));
-            }
-            let restored = TomlConfigLoader::new_from_str(&generated.dump()).unwrap();
-            assert_eq!(restored.get_flags().p2p_disguise().as_str(), mode);
-            let output = NetworkConfig::new_from_config(&restored).unwrap();
-            assert_eq!(
-                output.p2p_disguise_mode.as_deref(),
-                (mode != "prefer").then_some(mode)
-            );
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
     fn api_flags_round_trip_preserves_missing_default_and_custom_values() {
         for disabled in [None, Some(false), Some(true)] {
             for whitelist in [None, Some(false), Some(true)] {
@@ -1093,126 +1140,6 @@ mod tests {
             .gen_config()
             .is_err()
         );
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn p2p_defaults_and_explicit_settings_round_trip_through_toml() {
-        let defaults = TomlConfigLoader::default().get_flags();
-        assert_eq!(
-            defaults.p2p_disguise(),
-            crate::config::P2pDisguiseMode::Prefer
-        );
-        assert_eq!(defaults.default_protocol, "udp");
-        assert!(defaults.close_redundant_conns_when_disguised);
-
-        for (mode, protocol, cleanup) in [
-            (None, None, None),
-            (None, Some(""), None),
-            (None, Some("  "), None),
-            (Some("off"), Some("udp"), Some(false)),
-            (Some("prefer"), Some("tcp"), Some(false)),
-            (Some("off"), Some("tcp"), Some(true)),
-        ] {
-            let input = NetworkConfig {
-                p2p_disguise_mode: mode.map(str::to_owned),
-                p2p_prefer_protocol: protocol.map(str::to_owned),
-                close_redundant_conns_when_disguised: cleanup,
-                ..standalone_config()
-            };
-            let expected_mode = mode.unwrap_or("prefer");
-            let expected_protocol = protocol
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("udp");
-            let expected_cleanup = cleanup.unwrap_or(true);
-            let config = input.gen_config().unwrap();
-            let flags = config.get_flags();
-            assert_eq!(flags.p2p_disguise().as_str(), expected_mode);
-            assert_eq!(flags.default_protocol, expected_protocol);
-            assert_eq!(flags.close_redundant_conns_when_disguised, expected_cleanup);
-
-            let restored = TomlConfigLoader::new_from_str(&config.dump()).unwrap();
-            let flags = restored.get_flags();
-            assert_eq!(flags.p2p_disguise().as_str(), expected_mode);
-            assert_eq!(flags.default_protocol, expected_protocol);
-            assert_eq!(flags.close_redundant_conns_when_disguised, expected_cleanup);
-            let output = NetworkConfig::new_from_config(&restored).unwrap();
-            assert_eq!(
-                output.p2p_disguise_mode.as_deref(),
-                (expected_mode != "prefer").then_some(expected_mode)
-            );
-            assert_eq!(
-                output.close_redundant_conns_when_disguised,
-                cleanup.filter(|value| !value)
-            );
-            assert_eq!(
-                output.p2p_prefer_protocol.as_deref(),
-                (expected_protocol != "udp").then_some(expected_protocol)
-            );
-            #[cfg(feature = "web-client")]
-            {
-                let output = crate::config::api::network_config_from_toml(&restored);
-                assert_eq!(
-                    output.p2p_disguise_mode.as_deref(),
-                    (expected_mode != "prefer").then_some(expected_mode)
-                );
-                assert_eq!(
-                    output.close_redundant_conns_when_disguised,
-                    cleanup.filter(|value| !value)
-                );
-                assert_eq!(
-                    output.p2p_prefer_protocol.as_deref(),
-                    (expected_protocol != "udp").then_some(expected_protocol)
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn disguise_api_flags_preserve_missing_and_explicit_values() {
-        for value in [None, Some(false), Some(true)] {
-            let input = NetworkConfig {
-                close_redundant_conns_when_disguised: value,
-                dev_name: Some(String::new()),
-                encryption_algorithm: Some(String::new()),
-                instance_recv_bps_limit: Some(0),
-                socket_mark: Some(0),
-                ..standalone_config()
-            };
-            let config = input.gen_config().unwrap();
-            let restored = TomlConfigLoader::new_from_str(&config.dump()).unwrap();
-            let output = NetworkConfig::new_from_config(&restored).unwrap();
-            assert_eq!(
-                output.close_redundant_conns_when_disguised,
-                value.filter(|value| !value)
-            );
-            assert_eq!(output.dev_name, None);
-            assert_eq!(output.encryption_algorithm.as_deref(), Some(""));
-            assert_eq!(output.instance_recv_bps_limit, Some(0));
-            assert_eq!(output.socket_mark, Some(0));
-            assert_eq!(output.p2p_prefer_protocol, None);
-        }
-    }
-
-    #[test]
-    fn magic_dns_zone_round_trips_missing_default_and_custom_values() {
-        for zone in [None, Some("et.net."), Some("nas.internal.")] {
-            let input = NetworkConfig {
-                tld_dns_zone: zone.map(str::to_owned),
-                ..standalone_config()
-            };
-            let config = input.gen_config().unwrap();
-            let config = TomlConfigLoader::new_from_str(&config.dump()).unwrap();
-            assert_eq!(config.get_flags().tld_dns_zone, zone.unwrap_or("et.net."));
-            let output = NetworkConfig::new_from_config(&config).unwrap();
-            // An explicit default is not kept, like every other flag.
-            assert_eq!(
-                output.tld_dns_zone.as_deref(),
-                zone.filter(|zone| *zone != "et.net.")
-            );
-        }
     }
 
     #[test]
@@ -1304,55 +1231,6 @@ mod tests {
     }
 
     #[test]
-    fn global_sni_round_trips_through_toml_model() {
-        let input = NetworkConfig {
-            sni: Some("www.cloudflare.com".to_owned()),
-            ..standalone_config()
-        };
-
-        let config = input.gen_config().unwrap();
-        assert_eq!(config.get_sni(), "www.cloudflare.com");
-
-        let output = NetworkConfig::new_from_config(&config).unwrap();
-        assert_eq!(output.sni.as_deref(), Some("www.cloudflare.com"));
-    }
-
-    #[test]
-    fn parallel_transport_settings_round_trip_and_reset_to_implicit_defaults() {
-        let mut input = NetworkConfig {
-            parallel_connections: Some(5),
-            disable_parallel_connections: Some(true),
-            traffic_disguise: Some("video".into()),
-            ..standalone_config()
-        };
-        let config = input.gen_config().unwrap();
-        let output = NetworkConfig::new_from_config(&config).unwrap();
-        assert_eq!(output.parallel_connections, Some(5));
-        assert_eq!(output.disable_parallel_connections, Some(true));
-        assert_eq!(output.traffic_disguise.as_deref(), Some("video"));
-        input.parallel_connections = Some(1);
-        input.disable_parallel_connections = Some(false);
-        input.traffic_disguise = Some("speedtest".into());
-        let config = input.gen_config().unwrap();
-        let output = NetworkConfig::new_from_config(&config).unwrap();
-        assert_eq!(output.parallel_connections, None);
-        assert_eq!(output.disable_parallel_connections, None);
-        assert_eq!(output.traffic_disguise, None);
-        for key in [
-            "parallel_connections",
-            "disable_parallel_connections",
-            "traffic_disguise",
-        ] {
-            assert!(!config.dump().contains(key));
-        }
-        input.parallel_connections = Some(17);
-        assert!(input.gen_config().is_err());
-        input.parallel_connections = Some(1);
-        input.traffic_disguise = Some("invalid".into());
-        assert!(input.gen_config().is_err());
-    }
-
-    #[test]
     fn legacy_enabled_vpn_portal_config_reports_migration_error() {
         let error = NetworkConfig {
             enable_vpn_portal: Some(true),
@@ -1378,25 +1256,6 @@ mod tests {
         .unwrap();
 
         assert!(config.get_vpn_portal_config().is_none());
-    }
-
-    #[cfg(feature = "browser-config")]
-    #[test]
-    fn browser_merge_updates_and_clears_magic_dns_zone() {
-        let original = "[flags]\ntld_dns_zone = \"old.internal.\"\n";
-        for zone in [None, Some("et.net."), Some("nas.internal.")] {
-            let input = NetworkConfig {
-                tld_dns_zone: zone.map(str::to_owned),
-                ..standalone_config()
-            };
-            let merged = merge_network_config_toml(original, &input).unwrap();
-            let output = TomlConfigLoader::new_from_str(&merged).unwrap();
-            assert_eq!(output.get_flags().tld_dns_zone, zone.unwrap_or("et.net."));
-            assert_eq!(
-                output.get_flags_patch().tld_dns_zone.as_deref(),
-                zone.filter(|zone| *zone != "et.net.")
-            );
-        }
     }
 
     #[cfg(feature = "browser-config")]
@@ -1438,7 +1297,8 @@ private_mode = false
                     "enable_ipv6",
                     value.filter(|disabled| *disabled).map(|disabled| !disabled),
                 ),
-                ("accept_dns", value),
+                // Form defaults are compacted, so an explicit false is omitted.
+                ("accept_dns", value.filter(|enabled| *enabled)),
                 ("private_mode", value.filter(|enabled| !enabled)),
             ] {
                 assert_eq!(
@@ -1448,38 +1308,6 @@ private_mode = false
                 );
             }
         }
-    }
-
-    #[test]
-    fn display_name_names_the_instance_and_round_trips() {
-        let mut config = NetworkConfig {
-            network_name: Some("office".into()),
-            network_secret: Some("secret".into()),
-            networking_method: Some(manage::NetworkingMethod::Standalone as i32),
-            ..Default::default()
-        };
-        let toml = config.gen_config().unwrap();
-        assert_eq!(toml.get_inst_name(), "office");
-        assert_eq!(
-            NetworkConfig::new_from_config(&toml).unwrap().instance_name,
-            None
-        );
-        config.instance_name = Some("Head office".into());
-        let toml = config.gen_config().unwrap();
-        assert_eq!(toml.get_inst_name(), "Head office");
-        assert_eq!(
-            NetworkConfig::new_from_config(&toml)
-                .unwrap()
-                .instance_name
-                .as_deref(),
-            Some("Head office")
-        );
-        // A console-created file starts named by its instance id.
-        toml.set_inst_name(toml.get_id().to_string());
-        assert_eq!(
-            NetworkConfig::new_from_config(&toml).unwrap().instance_name,
-            None
-        );
     }
 
     #[cfg(feature = "browser-config")]
@@ -1520,40 +1348,6 @@ disable_p2p = true
         );
         assert_eq!(merged["flags"]["default_protocol"].as_str(), Some("tcp"));
         assert!(merged["flags"].get("disable_p2p").is_none());
-    }
-
-    #[cfg(feature = "browser-config")]
-    #[test]
-    fn browser_merge_updates_sni_protocol_and_disguise_flags() {
-        let original = r#"
-sni = "old.example.com"
-
-[flags]
-default_protocol = "tcp"
-only_use_wss_http3_for_hole_punching = true
-prefer_wss_http3_for_p2p = true
-disable_wss_http3_for_p2p = false
-close_redundant_conns_when_disguised = true
-multi_thread_count = 7
-"#;
-        let parsed = TomlConfigLoader::new_from_str(original).unwrap();
-        let mut config = NetworkConfig::new_from_config(&parsed).unwrap();
-        // The legacy booleans load as the equivalent mode.
-        assert_eq!(config.p2p_disguise_mode.as_deref(), Some("only"));
-        config.sni = Some("new.example.com".to_owned());
-        config.p2p_prefer_protocol = Some("udp".to_owned());
-        config.p2p_disguise_mode = Some("off".to_owned());
-        config.close_redundant_conns_when_disguised = Some(false);
-
-        let merged = merge_network_config_toml(original, &config).unwrap();
-        let restored = TomlConfigLoader::new_from_str(&merged).unwrap();
-        let output = NetworkConfig::new_from_config(&restored).unwrap();
-        assert_eq!(output.sni.as_deref(), Some("new.example.com"));
-        assert_eq!(output.p2p_prefer_protocol, None);
-        assert_eq!(output.p2p_disguise_mode.as_deref(), Some("off"));
-        assert!(!merged.contains("wss_http3"), "{merged}");
-        assert_eq!(output.close_redundant_conns_when_disguised, Some(false));
-        assert_eq!(restored.get_flags().multi_thread_count, 7);
     }
 
     #[cfg(feature = "browser-config")]
@@ -1618,6 +1412,64 @@ disableP2p = false
         let merged_table: toml::Table = toml::from_str(&merged).unwrap();
         assert!(!merged_table.contains_key("flags"));
     }
+    #[test]
+    fn udp_fec_flags_preserve_presence_through_api_and_toml() {
+        let values = |config: &NetworkConfig| {
+            [
+                config.enable_udp_fec,
+                config.enable_udp_fec_kcp,
+                config.enable_udp_fec_quic,
+            ]
+        };
+        for enabled in [
+            [None; 3],
+            [Some(false); 3],
+            [Some(true); 3],
+            [Some(true), None, None],
+            [None, Some(true), None],
+            [None, None, Some(true)],
+            [Some(true), Some(false), Some(true)],
+        ] {
+            let input = NetworkConfig {
+                enable_udp_fec: enabled[0],
+                enable_udp_fec_kcp: enabled[1],
+                enable_udp_fec_quic: enabled[2],
+                ..standalone_config()
+            };
+            let config = input.gen_config().unwrap();
+            let patch = config.get_flags_patch();
+            // A form value equal to the default is not stored.
+            let enabled = enabled.map(|value| value.filter(|enabled| *enabled));
+            assert_eq!(
+                [
+                    patch.enable_udp_fec,
+                    patch.enable_udp_fec_kcp,
+                    patch.enable_udp_fec_quic,
+                ],
+                enabled
+            );
+            let flags = config.get_flags();
+            assert_eq!(
+                [
+                    flags.enable_udp_fec,
+                    flags.enable_udp_fec_kcp,
+                    flags.enable_udp_fec_quic,
+                ],
+                enabled.map(|value| value.unwrap_or(false))
+            );
+            #[cfg(feature = "config-write")]
+            {
+                let restored = TomlConfigLoader::new_from_str(&config.dump()).unwrap();
+                assert_eq!(
+                    values(&NetworkConfig::new_from_config(restored).unwrap()),
+                    enabled
+                );
+            }
+            let output = NetworkConfig::new_from_config(config).unwrap();
+            assert_eq!(values(&output), enabled);
+        }
+    }
+
     #[test]
     fn manual_routes_preserve_empty_and_automatic_modes() {
         for routes in [Vec::new(), vec!["10.20.0.0/24".to_owned()]] {
@@ -1716,27 +1568,6 @@ disableP2p = false
                 readback.dhcp_ipv6_cidr
             );
         }
-    }
-
-    #[test]
-    fn upstream_dhcp_and_custom_transport_policy_survive_toml_round_trip() {
-        let input = NetworkConfig {
-            dhcp: Some(true),
-            dhcp_ipv4_cidr: Some("10.55.0.0/24".to_owned()),
-            dhcpv6: Some(true),
-            dhcp_ipv6_cidr: Some("fd55::/64".to_owned()),
-            sni: Some("overlay.example.com".to_owned()),
-            p2p_disguise_mode: Some("only".to_owned()),
-            ..standalone_config()
-        };
-        let generated = input.gen_config().unwrap();
-        let loaded = TomlConfigLoader::new_from_str(&generated.dump()).unwrap();
-        let readback = NetworkConfig::new_from_config(&loaded).unwrap();
-        assert_eq!(readback.dhcp_ipv4_cidr, input.dhcp_ipv4_cidr);
-        assert_eq!(readback.dhcpv6, input.dhcpv6);
-        assert_eq!(readback.dhcp_ipv6_cidr, input.dhcp_ipv6_cidr);
-        assert_eq!(readback.sni, input.sni);
-        assert_eq!(readback.p2p_disguise_mode, input.p2p_disguise_mode);
     }
 
     #[test]

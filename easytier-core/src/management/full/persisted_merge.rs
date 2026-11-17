@@ -88,6 +88,7 @@ fn normalized_json(value: Value) -> Value {
 fn document_paths(field: &str) -> Option<Vec<&'static str>> {
     let paths = match field {
         "hostname" => vec!["hostname"],
+        "dns" => vec!["dns"],
         "sni" => vec!["sni"],
         "parallel_connections" => vec!["parallel_connections"],
         "disable_parallel_connections" => vec!["disable_parallel_connections"],
@@ -112,7 +113,6 @@ fn document_paths(field: &str) -> Option<Vec<&'static str>> {
         "listener_urls" => vec!["listeners"],
         "enable_manual_routes" | "routes" => vec!["routes"],
         "exit_nodes" => vec!["exit_nodes"],
-        "vpn" => vec!["vpn"],
         "enable_socks5" | "socks5_port" => vec!["socks5_proxy"],
         "mapped_listeners" => vec!["mapped_listeners"],
         "port_forwards" => vec!["port_forward"],
@@ -125,13 +125,6 @@ fn document_paths(field: &str) -> Option<Vec<&'static str>> {
         "enable_relay_network_whitelist" | "relay_network_whitelist" => {
             vec!["flags.relay_network_whitelist"]
         }
-        // Writing the mode also retires the legacy booleans it replaces.
-        "p2p_disguise_mode" => vec![
-            "flags.p2p_disguise_mode",
-            "flags.prefer_wss_http3_for_p2p",
-            "flags.disable_wss_http3_for_p2p",
-            "flags.only_use_wss_http3_for_hole_punching",
-        ],
         _ => return easytier_proto::common::Flags::api_document_path(field).map(|path| vec![path]),
     };
     Some(paths)
@@ -512,7 +505,6 @@ pub(super) fn merge_legacy_form_changes(
         "dhcp",
         "dhcpv6",
         "exit_nodes",
-        "vpn",
         "secure_mode",
         "mapped_listeners",
     ] {
@@ -574,12 +566,7 @@ mod tests {
     fn generated_flag_paths_keep_compound_document_ownership() {
         assert_eq!(
             document_paths("p2p_disguise_mode").unwrap(),
-            vec![
-                "flags.p2p_disguise_mode",
-                "flags.prefer_wss_http3_for_p2p",
-                "flags.disable_wss_http3_for_p2p",
-                "flags.only_use_wss_http3_for_hole_punching",
-            ]
+            vec!["flags.p2p_disguise_mode"]
         );
         for (fields, path) in [
             (
@@ -726,10 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn unified_disguise_patch_replaces_legacy_flags_and_reset_uses_default() {
-        let original = format!(
-            "{ORIGINAL}prefer_wss_http3_for_p2p = false\nonly_use_wss_http3_for_hole_punching = true\n"
-        );
+    fn disguise_patch_replaces_the_mode_and_reset_uses_default() {
+        let original = format!("{ORIGINAL}p2p_disguise_mode = \"only\"\n");
         let mask = ["p2p_disguise_mode".to_owned()];
         let merged = merge_persisted_config(
             &original,
@@ -743,28 +728,24 @@ mod tests {
         let flags = TomlConfig::new_from_str(&merged).unwrap().get_flags();
         assert_eq!(flags.p2p_disguise().as_str(), "off");
         assert!(merged.contains("# retained comment"));
-        assert!(!merged.contains("prefer_wss_http3_for_p2p ="));
-        assert!(!merged.contains("only_use_wss_http3_for_hole_punching ="));
 
-        // An omitted selected value resets the whole policy, including old overrides.
+        // An omitted selected value resets the policy to the default.
         let reset = merge_persisted_config(&original, &NetworkConfig::default(), &mask).unwrap();
         let flags = TomlConfig::new_from_str(&reset).unwrap().get_flags();
         assert_eq!(flags.p2p_disguise().as_str(), "prefer");
         assert!(!reset.contains("p2p_disguise_mode ="));
-        assert!(!reset.contains("only_use_wss_http3_for_hole_punching ="));
     }
 
     #[test]
     fn full_form_save_removes_explicit_defaults_and_keeps_unmanaged_values() {
         let original = format!(
-            "{ORIGINAL}private_mode = true\nlatency_first = false\nmulti_thread_count = 7\n[vpn]\nrules = []\n"
+            "{ORIGINAL}private_mode = true\nlatency_first = false\nmulti_thread_count = 7\n"
         );
         let loaded = TomlConfig::new_from_str(&original).unwrap();
         let form = network_config_from_toml(&loaded);
         let merged = merge_legacy_form_changes(&original, &form.gen_config().unwrap()).unwrap();
         assert!(merged.starts_with("# retained comment"));
         let document: toml::Table = toml::from_str(&merged).unwrap();
-        assert!(!document.contains_key("vpn"));
         let flags = document["flags"].as_table().unwrap();
         assert!(!flags.contains_key("default_protocol"));
         assert!(!flags.contains_key("private_mode"));

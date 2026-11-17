@@ -20,7 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) const FEATURE_PREFIX: &str = "p2p-parallel-v1:";
+/// Version 2 envelopes chain each packet to the previous one of its flow, and
+/// receivers order per flow; a version 1 peer stays on one connection.
+pub(crate) const FEATURE_PREFIX: &str = "p2p-parallel-v2:";
+/// Epoch, sequence and the distance back to the flow's previous packet.
+const ENVELOPE_SIZE: usize = 28;
 #[cfg(test)]
 pub(crate) const OVERHEAD: usize = crate::packet::PARALLEL_PACKET_OVERHEAD;
 const MAX_PACKETS: usize = 8192;
@@ -37,6 +41,57 @@ fn reserve_budget(budget: &AtomicUsize, bytes: usize, limit: usize) -> bool {
             used.checked_add(bytes).filter(|total| *total <= limit)
         })
         .is_ok()
+}
+
+/// Periodic receiver/queue state logging, on when ET_PARALLEL_DIAG is set.
+pub(crate) fn diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ET_PARALLEL_DIAG").is_ok_and(|v| v != "0"))
+}
+
+/// Silent-drop counters, for ET_PARALLEL_DIAG logging: striped envelopes are
+/// dropped without a trace on several paths, and a wedge only shows them.
+#[derive(Default)]
+pub(crate) struct DropCounters(pub(crate) [AtomicUsize; 8]);
+pub(crate) mod drops {
+    use std::sync::atomic::Ordering;
+
+    pub(crate) const EPOCH: usize = 0;
+    pub(crate) const BAD: usize = 1;
+    pub(crate) const DUP: usize = 2;
+    pub(crate) const LATE: usize = 3;
+    pub(crate) const BUDGET: usize = 4;
+    pub(crate) const UNWRAP: usize = 5;
+    pub(crate) const LIMITER: usize = 6;
+    pub(crate) const PROXY: usize = 7;
+    /// Process-global so every path can count without plumbing a handle.
+    pub(crate) static COUNTERS: super::DropCounters = super::DropCounters([
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+        std::sync::atomic::AtomicUsize::new(0),
+    ]);
+    pub(crate) fn bump(slot: usize) {
+        COUNTERS.0[slot].fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn summary() -> String {
+        let c = &COUNTERS.0;
+        format!(
+            "epoch {} bad {} dup {} late {} budget {} unwrap {} limiter {} proxy {}",
+            c[EPOCH].load(Ordering::Relaxed),
+            c[BAD].load(Ordering::Relaxed),
+            c[DUP].load(Ordering::Relaxed),
+            c[LATE].load(Ordering::Relaxed),
+            c[BUDGET].load(Ordering::Relaxed),
+            c[UNWRAP].load(Ordering::Relaxed),
+            c[LIMITER].load(Ordering::Relaxed),
+            c[PROXY].load(Ordering::Relaxed),
+        )
+    }
 }
 
 pub(crate) fn tx_epoch(features: &[String]) -> Option<uuid::Uuid> {
@@ -140,6 +195,21 @@ impl ParallelDialReservation {
 impl Drop for ParallelDialReservation {
     fn drop(&mut self) {
         self.reservations.0.lock().remove(&self.token.slot);
+    }
+}
+
+/// Runs one automatic dial in the peer's parallel pool. A peer whose pool
+/// (`pool_target > 1`) has no free slot for the dial's protocol is skipped:
+/// the dial is not started and `None` is returned.
+pub(crate) async fn dial_in_slot<F: std::future::Future>(
+    reservation: Option<ParallelDialReservation>,
+    pool_target: u32,
+    dial: F,
+) -> Option<F::Output> {
+    match reservation {
+        Some(reservation) => Some(reservation.scope(dial).await),
+        None if pool_target > 1 => None,
+        None => Some(dial.await),
     }
 }
 
@@ -346,12 +416,15 @@ pub(crate) fn stripeable(packet: &ZCPacket) -> bool {
         .is_some_and(|h| is_relay_data_packet_type(h.packet_type))
 }
 
+/// `prev` is how far back the previous packet of the same flow is, or zero
+/// when the flow starts here.
 pub(crate) fn wrap(
     packet: ZCPacket,
     from: PeerId,
     to: PeerId,
     epoch: uuid::Uuid,
     seq: u64,
+    prev: u32,
 ) -> ZCPacket {
     let packet_type = if packet.is_lossy() {
         PacketType::ParallelLossyData
@@ -361,15 +434,18 @@ pub(crate) fn wrap(
     let latency_first = packet
         .peer_manager_header()
         .is_some_and(|h| h.is_latency_first());
-    let mut payload = Vec::with_capacity(24 + packet.tunnel_payload().len());
+    let mut payload = Vec::with_capacity(ENVELOPE_SIZE + packet.tunnel_payload().len());
     payload.extend_from_slice(epoch.as_bytes());
     payload.extend_from_slice(&seq.to_be_bytes());
+    payload.extend_from_slice(&prev.to_be_bytes());
     payload.extend_from_slice(packet.tunnel_payload());
     let mut out = ZCPacket::new_with_payload(&payload);
     out.fill_peer_manager_hdr(from, to, packet_type as u8);
     out.mut_peer_manager_header()
         .unwrap()
         .set_latency_first(latency_first);
+    // Local metadata: lets a multi-stream tunnel keep the flow on one stream.
+    out.flow_key = packet.flow_key;
     out
 }
 
@@ -379,7 +455,7 @@ pub(crate) fn unwrap(
     packet: ZCPacket,
     from: PeerId,
     to: PeerId,
-) -> Option<(uuid::Uuid, u64, ZCPacket)> {
+) -> Option<(uuid::Uuid, u64, Option<u64>, ZCPacket)> {
     let hdr = packet.peer_manager_header()?;
     let lossy = hdr.packet_type == PacketType::ParallelLossyData as u8;
     if (!lossy && hdr.packet_type != PacketType::ParallelData as u8)
@@ -390,7 +466,7 @@ pub(crate) fn unwrap(
         return None;
     }
     let payload = packet.payload();
-    if payload.len() < 24 + PEER_MANAGER_HEADER_SIZE {
+    if payload.len() < ENVELOPE_SIZE + PEER_MANAGER_HEADER_SIZE {
         return None;
     }
     let epoch = uuid::Uuid::from_slice(&payload[..16]).ok()?;
@@ -398,18 +474,26 @@ pub(crate) fn unwrap(
         return None;
     }
     let seq = u64::from_be_bytes(payload[16..24].try_into().ok()?);
-    let inner = ZCPacket::new_from_buf(BytesMut::from(&payload[24..]), ZCPacketType::DummyTunnel);
+    let prev = match u32::from_be_bytes(payload[24..28].try_into().ok()?) {
+        0 => None,
+        distance => Some(seq.checked_sub(u64::from(distance))?),
+    };
+    let inner = ZCPacket::new_from_buf(
+        BytesMut::from(&payload[ENVELOPE_SIZE..]),
+        ZCPacketType::DummyTunnel,
+    );
     // The original length describes the network packet before encryption;
     // AEAD tails and compression deliberately change the physical length.
     if !stripeable(&inner) || inner.is_lossy() != lossy {
         return None;
     }
-    Some((epoch, seq, inner))
+    Some((epoch, seq, prev, inner))
 }
 
 struct Buffered {
     packet: Option<ZCPacket>,
     ingress: PeerPacketIngress,
+    /// Bytes reserved from the shared budget; zero for a packet that never waits.
     bytes: usize,
     arrived: Instant,
 }
@@ -433,32 +517,129 @@ struct Lane {
     last: Instant,
 }
 
-/// Whether a transport delivers one connection's packets in order: stream
-/// transports do, datagram transports may reorder.
+/// Whether a transport delivers one connection's packets in order: single
+/// stream transports do. Datagram transports may reorder, and an HTTP3 tunnel
+/// spreads flows over several streams of its connection.
 pub(crate) fn ordered_transport(tunnel_type: &str) -> bool {
     matches!(
         tunnel_type.rsplit('-').next().unwrap_or(tunnel_type),
-        "tcp" | "ws" | "wss" | "http3" | "quic"
+        "tcp" | "ws" | "wss" | "quic"
     )
 }
 
+/// Sequences tracked for duplicates and for which predecessors were handed
+/// on. Anything older counts as settled.
+const WINDOW: u64 = 1 << 16;
+const _: () = assert!(WINDOW as usize > MAX_PACKETS);
+
+struct SequenceWindow {
+    low: u64,
+    received: Vec<u64>,
+    delivered: Vec<u64>,
+}
+impl Default for SequenceWindow {
+    fn default() -> Self {
+        Self {
+            low: 0,
+            received: vec![0; WINDOW as usize / 64],
+            delivered: vec![0; WINDOW as usize / 64],
+        }
+    }
+}
+impl SequenceWindow {
+    fn bit(seq: u64) -> (usize, u64) {
+        let slot = (seq % WINDOW) as usize;
+        (slot / 64, 1 << (slot % 64))
+    }
+    fn test(bits: &[u64], seq: u64) -> bool {
+        let (word, mask) = Self::bit(seq);
+        bits[word] & mask != 0
+    }
+    fn set(bits: &mut [u64], seq: u64) {
+        let (word, mask) = Self::bit(seq);
+        bits[word] |= mask;
+    }
+    fn received(&self, seq: u64) -> bool {
+        seq < self.low || Self::test(&self.received, seq)
+    }
+    fn mark_received(&mut self, seq: u64) {
+        if seq >= self.low {
+            Self::set(&mut self.received, seq);
+        }
+    }
+    /// A predecessor is satisfied once it was handed on or given up on.
+    fn settled(&self, seq: u64) -> bool {
+        seq < self.low || Self::test(&self.delivered, seq)
+    }
+    fn mark_settled(&mut self, seq: u64) {
+        if seq >= self.low {
+            Self::set(&mut self.received, seq);
+            Self::set(&mut self.delivered, seq);
+        }
+    }
+    /// Its successor no longer waits for it; should it still turn up, it is
+    /// handed on late rather than dropped.
+    fn mark_given_up(&mut self, seq: u64) {
+        if seq >= self.low {
+            Self::set(&mut self.delivered, seq);
+        }
+    }
+    fn reset(&mut self) {
+        self.low = 0;
+        self.received.fill(0);
+        self.delivered.fill(0);
+    }
+    /// Forgets everything below `low`, freeing its ring slots.
+    fn advance(&mut self, low: u64) {
+        if low <= self.low {
+            return;
+        }
+        if low - self.low >= WINDOW {
+            self.received.fill(0);
+            self.delivered.fill(0);
+        } else {
+            for seq in self.low..low {
+                let (word, mask) = Self::bit(seq);
+                self.received[word] &= !mask;
+                self.delivered[word] &= !mask;
+            }
+        }
+        self.low = low;
+    }
+}
+
+struct Waiting {
+    /// The flow's previous packet, which must be handed on first.
+    prev: u64,
+    buffered: Buffered,
+}
+
+/// Puts striped packets back in order per flow. Each packet names the previous
+/// packet of its flow, so a missing packet holds back only its own flow; the
+/// sender keeps flows apart from local metadata that is never on the wire.
 #[derive(Default)]
 struct ReorderState {
     epoch: Option<uuid::Uuid>,
     authorized: VecDeque<uuid::Uuid>,
-    next: u64,
-    packets: BTreeMap<u64, Buffered>,
+    window: SequenceWindow,
+    /// Packets whose predecessor has not been handed on, by sequence.
+    packets: BTreeMap<u64, Waiting>,
+    /// The waiting packet for each predecessor, by predecessor.
+    waiting_on: BTreeMap<u64, u64>,
     bytes: usize,
-    gap_since: Option<Instant>,
     lanes: HashMap<uuid::Uuid, Lane>,
     /// Delivery tickets issued so far; batches are delivered in ticket order.
     issued: u64,
+    /// Why waiting packets were handed on early, for tests.
+    #[cfg(test)]
+    released: BTreeMap<&'static str, u64>,
 }
 impl ReorderState {
     fn clear(&mut self) {
         self.packets.clear();
+        self.waiting_on.clear();
         self.bytes = 0;
-        self.gap_since = None;
+        self.window.reset();
         // Every lane may carry anything of a new epoch until it is seen.
         let now = Instant::now();
         for lane in self.lanes.values_mut() {
@@ -466,28 +647,55 @@ impl ReorderState {
             lane.last = now;
         }
     }
-    fn drain(&mut self, skip_gap: bool) -> Vec<Buffered> {
-        if skip_gap && let Some(first) = self.packets.keys().next() {
-            self.next = *first;
+    fn satisfied(&self, prev: Option<u64>) -> bool {
+        prev.is_none_or(|prev| self.window.settled(prev))
+    }
+    /// Hands on `seq` and every packet of its flow that waited behind it.
+    fn deliver_chain(&mut self, mut seq: u64, first: Buffered, out: &mut Vec<Buffered>) {
+        self.window.mark_settled(seq);
+        out.push(first);
+        while let Some(next) = self.waiting_on.remove(&seq) {
+            let Some(waiting) = self.packets.remove(&next) else {
+                break;
+            };
+            self.bytes -= waiting.buffered.bytes;
+            self.window.mark_settled(next);
+            out.push(waiting.buffered);
+            seq = next;
         }
-        let mut out = Vec::new();
-        while let Some(packet) = self.packets.remove(&self.next) {
-            self.next = self.next.saturating_add(1);
-            self.bytes -= packet.bytes;
-            out.push(packet);
-        }
-        self.gap_since = if self.packets.is_empty() {
-            None
-        } else if out.is_empty() {
-            self.gap_since.or_else(|| {
-                self.packets
-                    .first_key_value()
-                    .map(|(_, packet)| packet.arrived)
-            })
-        } else {
-            self.packets.values().map(|packet| packet.arrived).min()
+    }
+    /// Gives up on the predecessor of waiting packet `seq` and hands it on.
+    fn release(&mut self, seq: u64, out: &mut Vec<Buffered>) {
+        let Some(waiting) = self.packets.remove(&seq) else {
+            return;
         };
-        out
+        #[cfg(test)]
+        {
+            *self.released.entry(RELEASE_REASON.get()).or_default() += 1;
+        }
+        self.waiting_on.remove(&waiting.prev);
+        self.bytes -= waiting.buffered.bytes;
+        self.window.mark_given_up(waiting.prev);
+        self.deliver_chain(seq, waiting.buffered, out);
+    }
+    /// Moves the window up so `seq` fits; whatever waited below it or behind
+    /// a predecessor below it is handed on in sequence order.
+    fn make_room(&mut self, seq: u64, out: &mut Vec<Buffered>) {
+        if seq < self.window.low + WINDOW {
+            return;
+        }
+        let low = seq + 1 - WINDOW;
+        let stale: Vec<u64> = self
+            .packets
+            .iter()
+            .filter(|(seq, waiting)| **seq < low || waiting.prev < low)
+            .map(|(seq, _)| *seq)
+            .collect();
+        release_reason("window");
+        for seq in stale {
+            self.release(seq, out);
+        }
+        self.window.advance(low);
     }
     /// The lowest frontier of the active lanes, when every active lane is
     /// ordered and has been seen: a sequence still missing at or below it was
@@ -514,17 +722,22 @@ impl ReorderState {
             .peekable();
         active.peek().is_some() && active.all(|lane| lane.ordered)
     }
-    /// Skip gaps that every ordered lane has already passed, instead of
-    /// waiting for the reorder timer.
+    /// Hands on packets whose predecessor every ordered lane has passed
+    /// without carrying it, instead of waiting for the reorder timer.
     fn skip_lost(&mut self, now: Instant) -> Vec<Buffered> {
         let mut out = Vec::new();
-        while let Some(&first) = self.packets.keys().next()
-            && first != self.next
-            && self
-                .ordered_frontier(now)
-                .is_some_and(|frontier| first <= frontier.saturating_add(1))
-        {
-            out.extend(self.drain(true));
+        let Some(frontier) = self.ordered_frontier(now) else {
+            return out;
+        };
+        let lost: Vec<u64> = self
+            .waiting_on
+            .range(..=frontier)
+            .filter(|(prev, _)| !self.window.received(**prev))
+            .map(|(_, seq)| *seq)
+            .collect();
+        release_reason("frontier");
+        for seq in lost {
+            self.release(seq, &mut out);
         }
         out
     }
@@ -540,10 +753,27 @@ struct DeliveryTurns {
     served: u64,
     /// Tickets whose holder was cancelled before its turn.
     abandoned: BTreeSet<u64>,
-    /// When the latest batch finished. A lane blocked behind delivery cannot
-    /// read its next packet, so that time does not count towards a gap.
-    last_done: Option<Instant>,
+    /// When the latest batch that had to wait for the upper layer finished.
+    /// A lane blocked behind such a delivery could not read its next packet,
+    /// so that time does not count towards a gap. Batches that went straight
+    /// through do not count: on a busy pool one finishes every moment, and a
+    /// packet waiting for a lost predecessor would never expire.
+    last_blocked: Option<Instant>,
 }
+
+#[cfg(test)]
+thread_local! {
+    static RELEASE_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+}
+#[cfg(test)]
+fn release_reason(reason: &'static str) {
+    RELEASE_REASON.set(reason);
+}
+#[cfg(not(test))]
+fn release_reason(_: &'static str) {}
+
+/// A batch slower than this waited for the upper layer to make room.
+const BLOCKED_DELIVERY: Duration = Duration::from_millis(2);
 
 /// Completes a delivery ticket when dropped, including when the receiving
 /// task is cancelled, so a closed connection cannot stall later batches.
@@ -555,7 +785,6 @@ impl Drop for Turn<'_> {
     fn drop(&mut self) {
         {
             let mut turns = self.receiver.turns.lock();
-            turns.last_done = Some(Instant::now());
             if turns.served == self.ticket {
                 turns.served += 1;
                 loop {
@@ -594,6 +823,43 @@ impl ParallelReceiver {
             gap_ms: AtomicUsize::new(20),
         })
     }
+    #[cfg(test)]
+    pub(crate) fn state_summary(&self) -> String {
+        let s = self.state.lock();
+        format!(
+            "epoch {:?}, low {}, waiting {:?}, lanes {}, released {:?}",
+            s.epoch,
+            s.window.low,
+            s.packets
+                .iter()
+                .map(|(seq, w)| (*seq, w.prev))
+                .collect::<Vec<_>>(),
+            s.lanes.len(),
+            s.released
+        )
+    }
+    /// One line of live reorder state, for ET_PARALLEL_DIAG logging.
+    pub(crate) fn diag_summary(&self) -> String {
+        let mut out = self.diag_state();
+        out.push_str(" drops ");
+        out.push_str(&drops::summary());
+        out
+    }
+    fn diag_state(&self) -> String {
+        let s = self.state.lock();
+        let turns = self.turns.lock();
+        format!(
+            "epoch {} low {} waiting {} ({} B) lanes {} issued {} served {} gap_ms {}",
+            s.epoch.map_or("-".to_owned(), |e| e.to_string()),
+            s.window.low,
+            s.packets.len(),
+            s.bytes,
+            s.lanes.len(),
+            s.issued,
+            turns.served,
+            self.gap_ms.load(Ordering::Relaxed)
+        )
+    }
     pub(crate) fn set_max_rtt_us(&self, rtt: u64) {
         self.gap_ms.store(
             (rtt.saturating_mul(3) / 1000).clamp(20, 250) as usize,
@@ -623,7 +889,6 @@ impl ParallelReceiver {
         state.lanes.clear();
         state.epoch = None;
         state.authorized.clear();
-        state.next = 0;
     }
     pub(crate) fn authorize_epoch(&self, epoch: uuid::Uuid) {
         let mut state = self.state.lock();
@@ -648,6 +913,7 @@ impl ParallelReceiver {
             }
             notified.await;
         }
+        let started = Instant::now();
         for mut p in packets {
             if send_peer_packet_to_chan(&self.sender, p.packet.take().unwrap(), p.ingress)
                 .await
@@ -655,6 +921,9 @@ impl ParallelReceiver {
             {
                 break;
             }
+        }
+        if started.elapsed() >= BLOCKED_DELIVERY {
+            self.turns.lock().last_blocked = Some(Instant::now());
         }
     }
     /// Waits until packets are buffered behind a gap.
@@ -679,6 +948,7 @@ impl ParallelReceiver {
         &self,
         epoch: uuid::Uuid,
         seq: u64,
+        prev: Option<u64>,
         packet: ZCPacket,
         ingress: PeerPacketIngress,
     ) {
@@ -687,14 +957,26 @@ impl ParallelReceiver {
             if s.epoch != Some(epoch) {
                 let Some(position) = s.authorized.iter().position(|allowed| *allowed == epoch)
                 else {
+                    drops::bump(drops::EPOCH);
+                    #[cfg(test)]
+                    {
+                        *s.released.entry("drop-epoch").or_default() += 1;
+                    }
                     return;
                 };
                 s.authorized.remove(position);
                 s.clear();
                 s.epoch = Some(epoch);
-                s.next = 0;
             }
-            if seq == u64::MAX || seq.saturating_sub(s.next) > MAX_SEQUENCE_GAP {
+            if seq == u64::MAX
+                || seq.saturating_sub(s.window.low) > MAX_SEQUENCE_GAP
+                || prev.is_some_and(|prev| prev >= seq)
+            {
+                drops::bump(drops::BAD);
+                #[cfg(test)]
+                {
+                    *s.released.entry("drop-bad").or_default() += 1;
+                }
                 return;
             }
             let was_empty = s.packets.is_empty();
@@ -710,29 +992,77 @@ impl ParallelReceiver {
                 lane.last = now;
             }
             let mut ready = Vec::new();
-            let bytes = packet.buf_len();
-            if seq >= s.next && !s.packets.contains_key(&seq) && bytes <= MAX_BYTES {
-                while s.packets.len() >= MAX_PACKETS || s.bytes.saturating_add(bytes) > MAX_BYTES {
-                    ready.extend(s.drain(true));
-                }
-                // Capacity recovery can move `next` beyond this arrival while
-                // releasing older buffered packets. Never reinsert a late packet
-                // behind that new frontier or a later gap flush could rewind it.
-                if seq >= s.next && reserve_budget(&BUFFERED_BYTES, bytes, GLOBAL_MAX_BYTES) {
-                    s.bytes += bytes;
-                    s.packets.insert(
-                        seq,
-                        Buffered {
-                            packet: Some(packet),
-                            ingress,
-                            bytes,
-                            arrived: now,
-                        },
-                    );
-                    ready.extend(s.drain(false));
+            if s.window.received(seq) {
+                drops::bump(drops::DUP);
+            } else if s.window.settled(seq) {
+                drops::bump(drops::LATE);
+            }
+            #[cfg(test)]
+            {
+                let key = if s.window.received(seq) {
+                    Some("drop-dup")
+                } else if s.window.settled(seq) {
+                    Some("late")
+                } else {
+                    None
+                };
+                if let Some(key) = key {
+                    *s.released.entry(key).or_default() += 1;
                 }
             }
-            // A late or duplicate arrival still advances its lane's frontier.
+            // Duplicates and packets older than the window are dropped, but
+            // they still advance their lane's frontier. The window must make
+            // room for the sequence before the duplicate check: a sequence at
+            // or past the far edge aliases to a stale bit of the first lap,
+            // and testing that bit first would drop every packet of the new
+            // lap as a duplicate and never advance the window again.
+            s.make_room(seq, &mut ready);
+            if !s.window.received(seq) {
+                s.window.mark_received(seq);
+                let bytes = packet.buf_len();
+                if !s.satisfied(prev) && bytes <= MAX_BYTES {
+                    while s.packets.len() >= MAX_PACKETS
+                        || s.bytes.saturating_add(bytes) > MAX_BYTES
+                    {
+                        let Some(&oldest) = s.packets.keys().next() else {
+                            break;
+                        };
+                        release_reason("capacity");
+                        s.release(oldest, &mut ready);
+                    }
+                }
+                let waiting = |bytes| Buffered {
+                    packet: Some(packet),
+                    ingress,
+                    bytes,
+                    arrived: now,
+                };
+                match prev {
+                    // Capacity recovery may have handed on the predecessor.
+                    _ if s.satisfied(prev) => s.deliver_chain(seq, waiting(0), &mut ready),
+                    Some(prev)
+                        if bytes <= MAX_BYTES
+                            && reserve_budget(&BUFFERED_BYTES, bytes, GLOBAL_MAX_BYTES) =>
+                    {
+                        s.bytes += bytes;
+                        s.waiting_on.insert(prev, seq);
+                        s.packets.insert(
+                            seq,
+                            Waiting {
+                                prev,
+                                buffered: waiting(bytes),
+                            },
+                        );
+                    }
+                    _ => {
+                        drops::bump(drops::BUDGET);
+                        #[cfg(test)]
+                        {
+                            *s.released.entry("drop-budget").or_default() += 1;
+                        }
+                    }
+                }
+            }
             ready.extend(s.skip_lost(now));
             (
                 Self::issue(&mut s, ready),
@@ -760,12 +1090,22 @@ impl ParallelReceiver {
             };
             let delivering = {
                 let turns = self.turns.lock();
-                turns.served != s.issued || turns.last_done.is_some_and(|t| t.elapsed() < gap)
+                turns.served != s.issued || turns.last_blocked.is_some_and(|t| t.elapsed() < gap)
             };
-            if !delivering {
-                while s.gap_since.is_some_and(|t| t.elapsed() >= gap) {
-                    ready.extend(s.drain(true));
-                }
+            // Delivery may postpone a gap, never hold it forever: past this
+            // a waiting packet goes on even while batches keep flowing.
+            let limit = if delivering { gap + LANE_IDLE } else { gap };
+            let expired: Vec<u64> = s
+                .packets
+                .iter()
+                .filter(|(_, waiting)| {
+                    now.saturating_duration_since(waiting.buffered.arrived) >= limit
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+            release_reason(if delivering { "timer-cap" } else { "timer" });
+            for seq in expired {
+                s.release(seq, &mut ready);
             }
             Self::issue(&mut s, ready)
         };
@@ -778,6 +1118,19 @@ impl ParallelReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    impl ParallelReceiver {
+        /// One chain, as a single flow sends it.
+        async fn receive_in_order(
+            &self,
+            epoch: uuid::Uuid,
+            seq: u64,
+            packet: ZCPacket,
+            ingress: PeerPacketIngress,
+        ) {
+            self.receive(epoch, seq, seq.checked_sub(1), packet, ingress)
+                .await
+        }
+    }
     fn data(payload: &[u8]) -> ZCPacket {
         let mut packet = ZCPacket::new_with_payload(payload);
         packet.fill_peer_manager_hdr(1, 2, PacketType::Data as u8);
@@ -812,21 +1165,27 @@ mod tests {
                 origin: crate::peers::PeerConnectionOrigin::Direct,
             };
             for seq in 1..=MAX_PACKETS as u64 {
-                receiver.receive(epoch, seq, data(b""), ingress).await;
+                receiver
+                    .receive_in_order(epoch, seq, data(b""), ingress)
+                    .await;
             }
             assert_eq!(receiver.state.lock().packets.len(), MAX_PACKETS);
             receiver
-                .receive(epoch, 0, data(b"late during capacity recovery"), ingress)
+                .receive_in_order(epoch, 0, data(b"late during capacity recovery"), ingress)
                 .await;
             assert!(receiver.state.lock().packets.is_empty());
-            assert_eq!(receiver.state.lock().next, MAX_PACKETS as u64 + 1);
+            assert!(receiver.state.lock().window.settled(MAX_PACKETS as u64));
             receiver.flush_expired().await;
-            assert_eq!(receiver.state.lock().next, MAX_PACKETS as u64 + 1);
+            assert!(receiver.state.lock().packets.is_empty());
             let fresh = uuid::Uuid::new_v4();
             receiver.authorize_epoch(fresh);
             let payload = vec![0; MAX_BYTES / 2];
-            receiver.receive(fresh, 1, data(&payload), ingress).await;
-            receiver.receive(fresh, 3, data(&payload), ingress).await;
+            receiver
+                .receive_in_order(fresh, 1, data(&payload), ingress)
+                .await;
+            receiver
+                .receive_in_order(fresh, 3, data(&payload), ingress)
+                .await;
             assert!(receiver.state.lock().bytes <= MAX_BYTES);
             assert_eq!(receiver.state.lock().packets.len(), 1);
         })
@@ -883,11 +1242,22 @@ mod tests {
         packet.mut_inner().extend_from_slice(&[0x5a; 28]);
         let original = packet.tunnel_payload().to_vec();
         let epoch = uuid::Uuid::new_v4();
-        let wire = wrap(packet, 1, 2, epoch, 123);
+        packet.flow_key = Some(crate::packet::flow::FlowKey {
+            src: "10.0.0.1:1".parse().unwrap(),
+            dst: "10.0.0.2:2".parse().unwrap(),
+            protocol: 17,
+        });
+        let flow = packet.flow_key;
+        let wire = wrap(packet.clone(), 1, 2, epoch, 123, 5);
         assert_eq!(wire.tunnel_payload().len(), original.len() + OVERHEAD);
-        let (actual_epoch, seq, inner) = unwrap(wire, 1, 2).unwrap();
-        assert_eq!((actual_epoch, seq), (epoch, 123));
+        assert_eq!(wire.flow_key, flow);
+        let (actual_epoch, seq, prev, inner) = unwrap(wire, 1, 2).unwrap();
+        assert_eq!((actual_epoch, seq, prev), (epoch, 123, Some(118)));
         assert_eq!(inner.tunnel_payload(), original);
+        let start = wrap(packet.clone(), 1, 2, epoch, 7, 0);
+        assert_eq!(unwrap(start, 1, 2).unwrap().2, None);
+        // A predecessor before the first sequence is malformed.
+        assert!(unwrap(wrap(packet, 1, 2, epoch, 3, 4), 1, 2).is_none());
     }
     #[tokio::test]
     async fn reorders_across_connections_and_drops_duplicates() {
@@ -901,15 +1271,15 @@ mod tests {
             origin: crate::peers::PeerConnectionOrigin::Direct,
         };
         receiver
-            .receive(epoch, 1, ZCPacket::new_with_payload(b"one"), ingress)
+            .receive_in_order(epoch, 1, ZCPacket::new_with_payload(b"one"), ingress)
             .await;
         receiver
-            .receive(epoch, 0, ZCPacket::new_with_payload(b"zero"), ingress)
+            .receive_in_order(epoch, 0, ZCPacket::new_with_payload(b"zero"), ingress)
             .await;
         assert_eq!(rx.recv().await.unwrap().payload(), b"zero");
         assert_eq!(rx.recv().await.unwrap().payload(), b"one");
         receiver
-            .receive(epoch, 0, ZCPacket::new_with_payload(b"duplicate"), ingress)
+            .receive_in_order(epoch, 0, ZCPacket::new_with_payload(b"duplicate"), ingress)
             .await;
         assert!(
             tokio::time::timeout(Duration::from_millis(5), rx.recv())
@@ -930,7 +1300,7 @@ mod tests {
             origin: crate::peers::PeerConnectionOrigin::Direct,
         };
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 u64::MAX - 1,
                 ZCPacket::new_with_payload(b"bad"),
@@ -938,7 +1308,7 @@ mod tests {
             )
             .await;
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 MAX_PACKETS as u64,
                 ZCPacket::new_with_payload(b"recovered"),
@@ -949,7 +1319,7 @@ mod tests {
         receiver.flush_expired().await;
         assert_eq!(rx.recv().await.unwrap().payload(), b"recovered");
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 MAX_PACKETS as u64 + 1,
                 ZCPacket::new_with_payload(b"next"),
@@ -972,7 +1342,7 @@ mod tests {
         };
         for seq in [1u64, 3, 5] {
             receiver
-                .receive(
+                .receive_in_order(
                     epoch,
                     seq,
                     ZCPacket::new_with_payload(&seq.to_be_bytes()),
@@ -987,7 +1357,7 @@ mod tests {
         }
         let fresh = uuid::Uuid::new_v4();
         receiver
-            .receive(
+            .receive_in_order(
                 fresh,
                 0,
                 ZCPacket::new_with_payload(b"unauthorized"),
@@ -997,11 +1367,11 @@ mod tests {
         assert_eq!(receiver.state.lock().epoch, Some(epoch));
         receiver.authorize_epoch(fresh);
         receiver
-            .receive(fresh, 0, ZCPacket::new_with_payload(b"fresh"), ingress)
+            .receive_in_order(fresh, 0, ZCPacket::new_with_payload(b"fresh"), ingress)
             .await;
         assert_eq!(rx.recv().await.unwrap().payload(), b"fresh");
         receiver
-            .receive(epoch, 6, ZCPacket::new_with_payload(b"retired"), ingress)
+            .receive_in_order(epoch, 6, ZCPacket::new_with_payload(b"retired"), ingress)
             .await;
         assert_eq!(receiver.state.lock().epoch, Some(fresh));
     }
@@ -1024,7 +1394,7 @@ mod tests {
         receiver.register_lane(a, true);
         receiver.register_lane(b, true);
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 0,
                 ZCPacket::new_with_payload(b"zero"),
@@ -1035,7 +1405,7 @@ mod tests {
         // 1 was sent on `a`, which has already carried 3: it was lost. `b`
         // has not passed 1 yet, so it may still carry it.
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 3,
                 ZCPacket::new_with_payload(b"three"),
@@ -1048,7 +1418,7 @@ mod tests {
                 .is_err()
         );
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 2,
                 ZCPacket::new_with_payload(b"two"),
@@ -1057,7 +1427,7 @@ mod tests {
             .await;
         assert_eq!(rx.recv().await.unwrap().payload(), b"two");
         assert_eq!(rx.recv().await.unwrap().payload(), b"three");
-        assert_eq!(receiver.state.lock().next, 4);
+        assert!(receiver.state.lock().packets.is_empty());
     }
 
     #[tokio::test]
@@ -1070,7 +1440,7 @@ mod tests {
         receiver.register_lane(a, true);
         receiver.register_lane(b, false);
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 1,
                 ZCPacket::new_with_payload(b"one"),
@@ -1078,7 +1448,7 @@ mod tests {
             )
             .await;
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 2,
                 ZCPacket::new_with_payload(b"two"),
@@ -1098,11 +1468,11 @@ mod tests {
     }
 
     #[test]
-    fn stream_transports_are_ordered_and_datagram_transports_are_not() {
+    fn single_stream_transports_are_ordered_and_others_are_not() {
         for (tunnel_type, ordered) in [
             ("tcp", true),
             ("wss", true),
-            ("http3", true),
+            ("http3", false),
             ("quic", true),
             ("udp", false),
             ("wg", false),
@@ -1157,7 +1527,7 @@ mod tests {
         receiver.register_lane(a, true);
         receiver.register_lane(b, true);
         receiver
-            .receive(
+            .receive_in_order(
                 epoch,
                 1,
                 ZCPacket::new_with_payload(b"one"),
@@ -1176,5 +1546,144 @@ mod tests {
         receiver.forget_lane(&b);
         receiver.flush_expired().await;
         assert_eq!(rx.recv().await.unwrap().payload(), b"one");
+    }
+
+    #[tokio::test]
+    async fn a_missing_packet_holds_back_only_its_own_flow() {
+        let (tx, mut rx) = crate::peers::create_packet_recv_chan();
+        let receiver = ParallelReceiver::new(tx);
+        let epoch = uuid::Uuid::new_v4();
+        receiver.authorize_epoch(epoch);
+        let ingress = lane_ingress(uuid::Uuid::new_v4());
+        let send = |seq: u64, prev: Option<u64>, payload: &'static [u8]| {
+            receiver.receive(
+                epoch,
+                seq,
+                prev,
+                ZCPacket::new_with_payload(payload),
+                ingress,
+            )
+        };
+        async fn quiet(rx: &mut crate::peers::PacketRecvChanReceiver) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), rx.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        // Flow A: 0, 2 (lost), 4. Flow B: 1, 3.
+        send(0, None, b"a0").await;
+        assert_eq!(rx.recv().await.unwrap().payload(), b"a0");
+        send(4, Some(2), b"a2").await;
+        quiet(&mut rx).await;
+        send(1, None, b"b0").await;
+        send(3, Some(1), b"b1").await;
+        assert_eq!(rx.recv().await.unwrap().payload(), b"b0");
+        assert_eq!(rx.recv().await.unwrap().payload(), b"b1");
+        quiet(&mut rx).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        receiver.flush_expired().await;
+        assert_eq!(rx.recv().await.unwrap().payload(), b"a2");
+        // The given-up packet is handed on late should it still turn up; a
+        // second copy of it is a duplicate.
+        send(2, Some(0), b"a1 late").await;
+        assert_eq!(rx.recv().await.unwrap().payload(), b"a1 late");
+        send(2, Some(0), b"a1 again").await;
+        send(3, Some(1), b"b1 again").await;
+        quiet(&mut rx).await;
+        assert!(receiver.state.lock().packets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn other_flows_delivering_do_not_hold_back_a_lost_predecessor_forever() {
+        let (tx, mut rx) = crate::peers::create_packet_recv_chan();
+        let receiver = ParallelReceiver::new(tx);
+        let epoch = uuid::Uuid::new_v4();
+        receiver.authorize_epoch(epoch);
+        let ingress = lane_ingress(uuid::Uuid::new_v4());
+        // Flow A's packet 1 never arrives; its packet 2 waits for it.
+        receiver
+            .receive(epoch, 2, Some(1), ZCPacket::new_with_payload(b"a"), ingress)
+            .await;
+        // Flow B keeps delivering, as a busy transfer on other flows does,
+        // while the flush task runs as the peer's maintenance loop runs it.
+        let started = Instant::now();
+        let mut seq = 3;
+        let mut prev = None;
+        let mut released = None;
+        while started.elapsed() < Duration::from_millis(600) {
+            receiver
+                .receive(epoch, seq, prev, ZCPacket::new_with_payload(b"b"), ingress)
+                .await;
+            prev = Some(seq);
+            seq += 1;
+            receiver.flush_expired().await;
+            while let Ok(envelope) = rx.0.try_recv() {
+                if envelope.packet.payload() == b"a" && released.is_none() {
+                    released = Some(started.elapsed());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let released = released.expect("flow A stayed held while flow B delivered");
+        assert!(released < Duration::from_millis(200), "{released:?}");
+    }
+
+    #[tokio::test]
+    async fn a_receiver_survives_the_first_sequence_window_wrap() {
+        let (tx, mut rx) = crate::peers::create_packet_recv_chan();
+        let receiver = ParallelReceiver::new(tx);
+        let epoch = uuid::Uuid::new_v4();
+        receiver.authorize_epoch(epoch);
+        let ingress = lane_ingress(uuid::Uuid::new_v4());
+        let total = WINDOW + 4096;
+        let mut delivered = 0;
+        for seq in 0..total {
+            receiver
+                .receive_in_order(epoch, seq, data(b"x"), ingress)
+                .await;
+            while rx.0.try_recv().is_ok() {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, total,
+            "every packet across the first window wrap must be delivered"
+        );
+        assert!(
+            receiver.state.lock().window.low > 0,
+            "the window must advance past the first lap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jump_past_the_window_hands_on_what_waited_below_it() {
+        let (tx, mut rx) = crate::peers::create_packet_recv_chan();
+        let receiver = ParallelReceiver::new(tx);
+        let epoch = uuid::Uuid::new_v4();
+        receiver.authorize_epoch(epoch);
+        let ingress = lane_ingress(uuid::Uuid::new_v4());
+        receiver
+            .receive(
+                epoch,
+                5,
+                Some(4),
+                ZCPacket::new_with_payload(b"old"),
+                ingress,
+            )
+            .await;
+        receiver
+            .receive(
+                epoch,
+                WINDOW + 10,
+                Some(9),
+                ZCPacket::new_with_payload(b"new"),
+                ingress,
+            )
+            .await;
+        assert_eq!(rx.recv().await.unwrap().payload(), b"old");
+        // Its predecessor is now below the window, so it counts as settled.
+        assert_eq!(rx.recv().await.unwrap().payload(), b"new");
+        assert!(receiver.state.lock().packets.is_empty());
     }
 }

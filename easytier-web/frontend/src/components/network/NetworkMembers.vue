@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { Button, Checkbox, Column, DataTable, Dialog, Message, SelectButton, Skeleton, Tag, useToast } from 'primevue';
 import { useI18n } from 'vue-i18n';
 import { Api as LibApi, Utils } from 'easytier-frontend-lib';
 import type { MeshJoinResult } from '../../modules/api';
-import { deviceConfigStore, failureMessage, retryDeviceWrite, type NetworkMember } from '../../modules/networkDiscovery';
+import {
+    deviceConfigStore, failureMessage, memberDetails, networkClients, retryDeviceWrite, type NetworkClient, type NetworkMember,
+} from '../../modules/networkDiscovery';
 import { deviceName, failedResults, resultSeverity, useMeshNetwork } from '../../modules/meshNetworkContext';
 import { useDevicePopup } from '../../modules/devicePopup';
+import EntityName from '../EntityName.vue';
 
 const { t } = useI18n();
 const toast = useToast();
@@ -16,8 +19,9 @@ const devicePopup = useDevicePopup();
 const members = computed(() => network.value?.members ?? []);
 const editable = (member: NetworkMember) => LibApi.ConfigFilePermission.isEditable(member.permission);
 // Batch start and stop reach members whose configuration was read now;
-// temporary members follow their central record and locked ones are left alone.
-const actionable = (member: NetworkMember) => member.online && !member.credential && editable(member) && !member.locked;
+// temporary members follow their central record. A lock only keeps batch
+// edits off the settings, so locked members start and stop like the rest.
+const actionable = (member: NetworkMember) => member.online && !member.credential && editable(member);
 const selectable = ({ data }: { data: NetworkMember }) => actionable(data);
 
 const viewMode = ref<'table' | 'card'>(localStorage.getItem('meshMembers.viewMode') === 'table' ? 'table' : 'card');
@@ -51,7 +55,7 @@ const setEnabled = async (enabled: boolean) => {
         const results = await Promise.allSettled(targets.map(member => retryDeviceWrite(() =>
             deviceConfigStore(api, member.device).then(({ store }) => store.setEnabled(member.instanceId, enabled)))));
         const failed = results.flatMap((result, index) => result.status === 'rejected'
-            ? [`${deviceName(targets[index])}: ${failureMessage(result.reason)}`] : []);
+            ? [`${memberName(targets[index])}: ${failureMessage(result.reason)}`] : []);
         toast.add({
             severity: failed.length ? 'warn' : 'success',
             summary: t(enabled ? 'web.mesh_network.batch_start' : 'web.mesh_network.batch_stop'),
@@ -65,35 +69,57 @@ const setEnabled = async (enabled: boolean) => {
     }
 };
 
-// The name opens the network's status; "edit configuration" opens its form.
 const openStatus = (member: NetworkMember) => devicePopup.open(member.device.machine_id, member.instanceId);
 const openEditor = (member: NetworkMember) => devicePopup.open(member.device.machine_id, member.instanceId, true);
 
-// Virtual addresses come from the running networks, read in one request.
-const virtualIps = ref<Record<string, string>>({});
+// Running networks report their address and why they failed, read in one
+// request; their route tables also show the clients that joined without
+// this console.
+interface Runtime { address?: string; error?: string }
+const runtimes = ref<Record<string, Runtime>>({});
+const clients = ref<NetworkClient[]>([]);
 const runningDevices = computed(() => [...new Set(members.value
     .filter(member => member.online && member.running).map(member => member.device.machine_id))].sort().join(','));
-watch(runningDevices, async devices => {
+const readRuntimes = async () => {
+    const devices = runningDevices.value;
     if (!devices) {
-        virtualIps.value = {};
+        runtimes.value = {};
+        clients.value = [];
         return;
     }
     try {
-        const machines = await api.collect_topology_network_info(devices.split(','));
+        const details = await memberDetails(api, members.value);
         if (devices !== runningDevices.value) return;
-        const next: Record<string, string> = {};
-        for (const [machineId, { info }] of Object.entries(machines)) {
-            for (const [instanceId, detail] of Object.entries(info?.info?.map ?? {})) {
-                const address = detail?.my_node_info?.virtual_ipv4;
-                if (address?.address) next[`${machineId}/${instanceId}`] = Utils.ipv4InetToString(address);
-            }
+        const next: Record<string, Runtime> = {};
+        for (const [key, detail] of details) {
+            const address = detail?.my_node_info?.virtual_ipv4;
+            next[key] = {
+                address: address?.address ? Utils.ipv4InetToString(address) : undefined,
+                error: detail?.error_msg || undefined,
+            };
         }
-        virtualIps.value = next;
+        runtimes.value = next;
+        clients.value = networkClients(details, members.value);
     } catch (error) {
-        console.debug('Failed to read virtual addresses', error);
+        console.debug('Failed to read running networks', error);
     }
-}, { immediate: true });
-const virtualIp = (member: NetworkMember) => member.running ? virtualIps.value[member.key] : undefined;
+};
+watch(runningDevices, readRuntimes, { immediate: true });
+let runtimeTimer: number | undefined;
+onMounted(() => { runtimeTimer = window.setInterval(readRuntimes, 15_000); });
+onUnmounted(() => window.clearInterval(runtimeTimer));
+const runtime = (member: NetworkMember): Runtime => member.running ? runtimes.value[member.key] ?? {} : {};
+const virtualIp = (member: NetworkMember) => runtime(member).address;
+// A member goes by the device's name in the device list.
+const memberName = deviceName;
+const stateOf = (member: NetworkMember) => !member.online ? 'offline'
+    : !member.running ? 'stopped' : runtime(member).error ? 'failed' : 'running';
+const stateLabel = (member: NetworkMember) => {
+    const label = t(`web.mesh_network.${stateOf(member)}`);
+    const error = runtime(member).error;
+    return error ? `${label}: ${error}` : label;
+};
+const lastSeen = (member: NetworkMember) => member.device.last_seen?.replace('T', ' ').slice(0, 16) || '—';
 
 // --- adding devices: they join with the core settings and the preset ---
 
@@ -172,31 +198,30 @@ const candidateName = (deviceId: string) => {
             <h2>{{ t('web.mesh_network.no_members') }}</h2>
             <Button v-if="centralEnabled" icon="pi pi-plus" :label="t('web.mesh_network.add_device')" @click="openJoin" />
         </div>
-        <div v-else-if="viewMode === 'card'" class="member-cards">
-            <article v-for="member in members" :key="member.key" class="member-card" :class="{ offline: !member.online, selected: selectedKeys.includes(member.key) }">
-                <div class="member-card-title">
+        <div v-else-if="viewMode === 'card'" class="entity-cards member-cards">
+            <article v-for="member in members" :key="member.key" class="entity-card" :class="{ selected: selectedKeys.includes(member.key) }">
+                <header class="entity-card-head">
                     <Checkbox v-model="selectedKeys" :value="member.key" :input-id="`member-${member.key}`" :disabled="!actionable(member)"
-                        :aria-label="deviceName(member)" />
-                    <button class="entity-link min-w-0" @click="openStatus(member)">
-                        <span class="status-dot" :class="member.online ? 'online' : 'offline'"></span>
-                        <span class="preview-name truncate">{{ deviceName(member) }}</span>
-                    </button>
-                </div>
-                <div class="member-tags">
-                    <Tag v-if="!member.online" :value="t('web.mesh_network.offline')" severity="secondary" />
-                    <Tag v-else :value="member.running ? t('web.mesh_network.running') : t('web.mesh_network.stopped')" :severity="member.running ? 'success' : 'secondary'" />
-                    <Tag v-if="member.pending" :value="t('web.mesh_network.pending')" severity="info" v-tooltip.top="t('web.mesh_network.pending_hint')" />
-                    <Tag v-if="member.credential" :value="t('web.mesh_network.temporary')" severity="contrast" />
-                    <Tag v-if="member.locked" icon="pi pi-lock" :value="t('web.mesh_network.locked')" severity="warn" v-tooltip.top="t('advanced_locked_hint')" />
-                    <Tag v-if="!editable(member) && member.online" :value="t('web.mesh_network.readonly')" severity="warn" />
-                </div>
-                <div class="member-facts">
-                    <span v-if="virtualIp(member)" class="mono-value">{{ virtualIp(member) }}</span>
-                    <span v-if="member.device.easytier_version">v{{ member.device.easytier_version.split('-')[0] }}</span>
-                </div>
-                <div class="member-card-actions">
-                    <Button icon="pi pi-pencil" :label="t('web.mesh_network.edit_config')" text size="small" severity="secondary" @click="openEditor(member)" />
-                </div>
+                        :aria-label="memberName(member)" />
+                    <span class="status-dot" :class="stateOf(member)" role="img" :aria-label="stateLabel(member)" v-tooltip.top="stateLabel(member)"></span>
+                    <EntityName :name="memberName(member)" />
+                </header>
+                <dl class="entity-facts">
+                    <div><dt>{{ t('web.mesh_network.virtual_ip') }}</dt><dd class="mono-value">{{ virtualIp(member) || '—' }}</dd></div>
+                    <div><dt>{{ t('web.device.last_seen') }}</dt><dd>{{ lastSeen(member) }}</dd></div>
+                </dl>
+                <footer class="entity-card-foot">
+                    <div class="entity-flags">
+                        <i v-if="member.locked" class="pi pi-lock entity-lock" role="img" :aria-label="t('web.mesh_network.locked')"
+                            v-tooltip.top="t('advanced_locked_hint')"></i>
+                        <span v-if="runtime(member).error" class="entity-error" :title="runtime(member).error"><i class="pi pi-exclamation-circle" aria-hidden="true"></i>{{ runtime(member).error }}</span>
+                        <span v-if="member.pending" class="entity-flag info" v-tooltip.top="t('web.mesh_network.pending_hint')"><i class="pi pi-clock" aria-hidden="true"></i>{{ t('web.mesh_network.pending') }}</span>
+                    </div>
+                    <div class="entity-actions">
+                        <Button icon="pi pi-chart-line" :label="t('web.mesh_network.status')" text size="small" severity="secondary" @click="openStatus(member)" />
+                        <Button icon="pi pi-pencil" :label="t('web.console.edit')" :aria-label="t('web.mesh_network.edit_config')" text size="small" severity="secondary" @click="openEditor(member)" />
+                    </div>
+                </footer>
             </article>
         </div>
         <DataTable v-else v-model:selection="tableSelection" :value="members" data-key="key" class="console-table" size="small" scrollable
@@ -204,28 +229,62 @@ const candidateName = (deviceId: string) => {
             <Column selection-mode="multiple" header-style="width: 3rem" />
             <Column :header="t('web.mesh_network.devices')">
                 <template #body="{ data }">
-                    <button class="entity-link" @click="openStatus(data)"><span class="status-dot" :class="data.online ? 'online' : 'offline'"></span>
-                        <span class="preview-name">{{ deviceName(data) }}</span></button>
+                    <span class="member-cell"><span class="status-dot" :class="stateOf(data)" role="img" :aria-label="stateLabel(data)" v-tooltip.top="stateLabel(data)"></span>
+                        <span class="preview-name">{{ memberName(data) }}</span></span>
                 </template>
             </Column>
             <Column :header="t('web.mesh_network.virtual_ip')"><template #body="{ data }"><span class="mono-value">{{ virtualIp(data) || '—' }}</span></template></Column>
             <Column :header="t('web.mesh_network.status')">
                 <template #body="{ data }">
-                    <div class="flex flex-wrap gap-1">
-                        <Tag v-if="!data.online" :value="t('web.mesh_network.offline')" severity="secondary" />
-                        <Tag v-else :value="data.running ? t('web.mesh_network.running') : t('web.mesh_network.stopped')" :severity="data.running ? 'success' : 'secondary'" />
+                    <div class="flex flex-wrap items-center gap-1">
+                        <i v-if="data.locked" class="pi pi-lock entity-lock" role="img" :aria-label="t('web.mesh_network.locked')"
+                            v-tooltip.top="t('advanced_locked_hint')"></i>
+                        <span v-if="runtime(data).error" class="entity-error" :title="runtime(data).error"><i class="pi pi-exclamation-circle" aria-hidden="true"></i>{{ runtime(data).error }}</span>
                         <Tag v-if="data.pending" :value="t('web.mesh_network.pending')" severity="info" v-tooltip.top="t('web.mesh_network.pending_hint')" />
-                        <Tag v-if="data.credential" :value="t('web.mesh_network.temporary')" severity="contrast" />
-                        <Tag v-if="data.locked" icon="pi pi-lock" :value="t('web.mesh_network.locked')" severity="warn" />
-                        <Tag v-if="!editable(data) && data.online" :value="t('web.mesh_network.readonly')" severity="warn" />
                     </div>
                 </template>
             </Column>
-            <Column field="device.easytier_version" :header="t('web.device.version')" />
+            <Column :header="t('web.device.last_seen')"><template #body="{ data }"><span class="muted">{{ lastSeen(data) }}</span></template></Column>
             <Column :header="t('web.console.manage')">
-                <template #body="{ data }"><Button icon="pi pi-pencil" :label="t('web.mesh_network.edit_config')" text size="small" severity="secondary" @click="openEditor(data)" /></template>
+                <template #body="{ data }">
+                    <div class="flex items-center gap-1">
+                        <Button icon="pi pi-chart-line" :label="t('web.mesh_network.status')" text size="small" severity="secondary" @click="openStatus(data)" />
+                        <Button icon="pi pi-pencil" :label="t('web.mesh_network.edit_config')" text size="small" severity="secondary" @click="openEditor(data)" />
+                    </div>
+                </template>
             </Column>
         </DataTable>
+        <template v-if="clients.length">
+            <header class="section-heading clients-heading">
+                <h2>{{ t('web.mesh_network.clients') }}<span class="table-count">{{ clients.length }}</span></h2>
+            </header>
+            <p class="members-hint">{{ t('web.mesh_network.clients_hint') }}</p>
+            <div v-if="viewMode === 'card'" class="entity-cards member-cards client-cards">
+                <article v-for="client in clients" :key="client.key" class="entity-card">
+                    <header class="entity-card-head">
+                        <span class="status-dot running" role="img" :aria-label="t('web.mesh_network.running')"></span>
+                        <EntityName :name="client.hostname" />
+                    </header>
+                    <dl class="entity-facts">
+                        <div><dt>{{ t('web.mesh_network.virtual_ip') }}</dt><dd class="mono-value">{{ client.address || '—' }}</dd></div>
+                        <div><dt>Peer ID</dt><dd class="mono-value">{{ client.peerId }}</dd></div>
+                    </dl>
+                    <footer class="entity-card-foot">
+                        <div class="entity-flags"><span class="entity-flag">{{ t('web.dashboard.unmanaged') }}</span></div>
+                    </footer>
+                </article>
+            </div>
+            <DataTable v-else :value="clients" data-key="key" class="console-table client-table" size="small" scrollable>
+                <Column :header="t('web.mesh_network.devices')">
+                    <template #body="{ data }">
+                        <span class="member-cell"><span class="status-dot running" aria-hidden="true"></span>
+                            <span class="preview-name">{{ data.hostname }}</span></span>
+                    </template>
+                </Column>
+                <Column :header="t('web.mesh_network.virtual_ip')"><template #body="{ data }"><span class="mono-value">{{ data.address || '—' }}</span></template></Column>
+                <Column header="Peer ID"><template #body="{ data }"><span class="mono-value muted">{{ data.peerId }}</span></template></Column>
+            </DataTable>
+        </template>
     </section>
 
     <Dialog v-model:visible="joinVisible" modal class="console-dialog" :header="t('web.mesh_network.add_device')" :style="{ width: '36rem', maxWidth: 'calc(100vw - 32px)' }">
@@ -255,18 +314,11 @@ const candidateName = (deviceId: string) => {
 <style scoped>
 .members-heading { flex-wrap: wrap; }
 .members-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-left: auto; }
-.members-hint { margin: 0; padding: 0 18px 12px; font-size: 13px; color: var(--p-text-muted-color); }
-.member-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 12px; padding: 0 18px 18px; }
-.member-card {
-    display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 14px 16px;
-    border: 1px solid var(--console-border); border-radius: 8px; background: var(--console-panel);
-}
-.member-card.offline { opacity: .72; }
-.member-card.selected { border-color: var(--p-primary-color); }
-.member-card-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.member-tags { display: flex; flex-wrap: wrap; gap: 4px; }
-.member-facts { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--p-text-muted-color); }
-.member-card-actions { display: flex; justify-content: flex-end; padding-top: 8px; border-top: 1px solid var(--console-border); }
+.members-hint { margin: 0; padding: 0 20px 12px; font-size: 13px; color: var(--p-text-muted-color); }
+.clients-heading { border-top: 1px solid var(--console-border); }
+.clients-heading h2 { display: flex; align-items: center; gap: 8px; }
+.member-cards { padding-top: 0; }
+.member-cell { display: inline-flex; align-items: center; gap: 10px; min-width: 0; font-weight: 550; }
 .device-pick-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr)); gap: 8px; max-height: 18rem; overflow: auto; }
 .device-pick { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 10px; border: 1px solid var(--console-border); border-radius: 6px; }
 .device-pick label { cursor: pointer; }

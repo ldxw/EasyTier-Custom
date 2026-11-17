@@ -6,7 +6,7 @@ use crate::{
     config::{
         EncryptionAlgorithm, IpPrefix, NodeConfig, ProxyNetworkConfig, RouteConfig,
         gateway::{GatewayRuntimeConfig, ProxyRuntimeConfig},
-        peers::{AclRuleConfig, HostRoutingPolicy},
+        peers::{AclRuleConfig, HostRoutingPolicy, PublicIpv6ProviderConfig},
         runtime::CoreRuntimeConfig,
         toml::{ConfigLoader as _, Flags, TomlConfig},
     },
@@ -195,6 +195,18 @@ impl CoreInstanceConfig {
     ) -> anyhow::Result<Self> {
         config.get_flags_patch().validate_p2p_disguise()?;
         let flags = host.runtime_flags(config.get_flags());
+        if flags.enable_udp_fec {
+            let overhead = crate::packet::FEC_MAX_OVERHEAD as u32
+                + if flags.enable_encryption {
+                    crate::packet::StandardAeadTail::SIZE as u32
+                } else {
+                    0
+                };
+            anyhow::ensure!(
+                flags.mtu.checked_sub(overhead).is_some(),
+                "MTU must be at least {overhead} bytes when UDP FEC is enabled"
+            );
+        }
         let instance_id = config.get_id();
         let identity: crate::config::NetworkIdentity = config.get_network_identity().into();
         let managed_credentials = config.get_managed_credentials();
@@ -289,11 +301,6 @@ impl CoreInstanceConfig {
             } else {
                 config.get_exit_nodes()
             },
-            vpn: if host.ignore_unsupported_config && !host.proxy_enabled {
-                Default::default()
-            } else {
-                config.get_vpn()
-            },
             foreign_context_default_flags: host.runtime_flags(TomlConfig::default().get_flags()),
         };
 
@@ -359,7 +366,7 @@ impl CoreInstanceConfig {
             },
             public_ipv6_auto: config.get_ipv6_public_addr_auto()
                 && (!host.ignore_unsupported_config || host.public_ipv6_provider_supported),
-            public_ipv6_provider: crate::config::peers::PublicIpv6ProviderConfig {
+            public_ipv6_provider: PublicIpv6ProviderConfig {
                 provider_enabled: config.get_ipv6_public_addr_provider()
                     && (!host.ignore_unsupported_config || host.public_ipv6_provider_supported),
                 configured_prefix: (!host.ignore_unsupported_config
@@ -461,6 +468,31 @@ mod tests {
                 .to_string()
                 .contains("p2p_disguise_mode")
         );
+    }
+
+    #[test]
+    fn udp_fec_rejects_mtu_overhead_underflow() {
+        for (encryption, overhead) in [(false, 16), (true, 44)] {
+            let config = TomlConfig::default();
+            let mut flags = config.get_flags();
+            flags.enable_udp_fec = true;
+            flags.enable_encryption = encryption;
+            for mtu in [0, overhead - 1] {
+                flags.mtu = mtu;
+                config.set_flags(flags.clone());
+                assert!(CoreInstanceConfig::from_toml(&config).is_err());
+            }
+            for mtu in [overhead, 1280, 1380] {
+                flags.mtu = mtu;
+                config.set_flags(flags.clone());
+                assert!(CoreInstanceConfig::from_toml(&config).is_ok());
+                assert_eq!(config.get_flags().mtu, mtu);
+            }
+            flags.enable_udp_fec = false;
+            flags.mtu = 0;
+            config.set_flags(flags);
+            assert!(CoreInstanceConfig::from_toml(&config).is_ok());
+        }
     }
 
     #[test]
@@ -745,6 +777,13 @@ disable_p2p = true
         assert!(normalized.connectivity.runtime.proxy.enable_exit_node);
         assert!(normalized.connectivity.runtime.proxy.force_smoltcp);
         assert!(normalized.connectivity.runtime.proxy.icmp_failure_is_fatal);
+        assert!(
+            normalized
+                .connectivity
+                .runtime
+                .public_ipv6_provider
+                .provider_supported
+        );
         assert!(!normalized.connectivity.startup_plan.gateway);
         assert!(!normalized.connectivity.manual.allow_interface_bind);
         assert!(!normalized.connectivity.direct.allow_interface_bind);
@@ -778,6 +817,7 @@ data_compress_algo = "Zstd"
         )
         .unwrap();
         config.set_exit_nodes(vec!["10.144.144.2".parse().unwrap()]);
+        config.set_ipv6_public_addr_provider(true);
         config.get_id();
         let before = config.dump();
 
@@ -821,6 +861,13 @@ data_compress_algo = "Zstd"
         );
         assert!(normalized.peer.exit_nodes.is_empty());
         assert!(!normalized.connectivity.runtime.proxy.enable_exit_node);
+        assert!(
+            !normalized
+                .connectivity
+                .runtime
+                .public_ipv6_provider
+                .provider_enabled
+        );
         let flags = &normalized.peer.snapshot.flags;
         assert!(!flags.enable_kcp_proxy);
         assert!(!flags.enable_quic_proxy);

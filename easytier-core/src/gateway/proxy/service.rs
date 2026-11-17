@@ -14,8 +14,7 @@ use crate::{
     config::IpPrefix,
     config::runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfigStore},
     connectivity::{
-        direct::DirectConnectorHost, hole_punch::tcp::TcpHolePunchHost,
-        port_in_use_by_local_listener,
+        direct::DirectConnectorHost, hole_punch::tcp::TcpHolePunchHost, protocol::protocol_uses_udp,
     },
     foundation::stats::{LabelSet, LabelType, MetricName, StatsManager},
     listener::RunningListenerRegistry,
@@ -70,21 +69,9 @@ fn runtime_snapshot(
         .ipv4
         .as_ref()
         .and_then(ipv4_inet);
-    let local_ipv6 = config
-        .peer
-        .runtime
-        .core
-        .routes
-        .ipv6
-        .as_ref()
-        .and_then(|prefix| match prefix.address {
-            IpAddr::V6(address) => Some(address),
-            IpAddr::V4(_) => None,
-        });
     ProxyRuntimeSnapshot {
         local_inet: smoltcp_enabled.then(smoltcp_proxy_inet).or(virtual_inet),
         virtual_ipv4: virtual_inet.map(|inet| inet.address()),
-        local_ipv6,
         no_tun: config.services.proxy.no_tun,
         enable_exit_node: config.services.proxy.enable_exit_node,
         smoltcp_enabled,
@@ -145,11 +132,14 @@ where
             return false;
         }
 
-        port_in_use_by_local_listener(
-            &self.running_listeners.running_listeners(),
-            destination.port(),
-            is_udp,
-        ) || (!is_udp && self.protected_tcp_ports.contains(destination.port()))
+        self.running_listeners
+            .running_listeners()
+            .iter()
+            .any(|listener| {
+                listener.port() == Some(destination.port())
+                    && protocol_uses_udp(listener.scheme()) == is_udp
+            })
+            || (!is_udp && self.protected_tcp_ports.contains(destination.port()))
     }
 }
 
@@ -435,7 +425,6 @@ mod tests {
         config::peers::{PeerRuntimeConfig, PeerRuntimeSnapshot},
         config::runtime::{CoreInstanceRuntimeConfig, CoreRuntimeConfig},
         config::{CoreConfig, IpPrefix, PeerPolicyConfig, ProxyNetworkConfig, RouteConfig},
-        connectivity::protocol::protocol_uses_udp,
     };
 
     use super::*;

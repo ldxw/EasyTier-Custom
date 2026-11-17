@@ -38,7 +38,7 @@ use easytier::{
         acl::{Acl, AclStats},
         api::{
             config::{
-                AclPatch, ConfigPatchAction, ConfigRpc, ConfigRpcClientFactory,
+                AclPatch, ConfigPatchAction, ConfigRpc, ConfigRpcClientFactory, GetConfigRequest,
                 InstanceConfigPatch, PatchConfigRequest, PortForwardPatch, StringPatch, UrlPatch,
                 VpnPortalClientPatch,
             },
@@ -47,13 +47,13 @@ use easytier::{
                 ConnectorManageRpcClientFactory, CredentialInfo, CredentialManageRpc,
                 CredentialManageRpcClientFactory, DumpRouteRequest, ForeignNetworkEntryPb,
                 GenerateCredentialRequest, GetAclStatsRequest, GetPrometheusStatsRequest,
-                GetStatsRequest, GetVpnPortalInfoRequest, GetVpnStatusRequest,
-                GetVpnStatusResponse, GetWhitelistRequest, GetWhitelistResponse,
-                InstanceIdentifier, ListConnectorRequest, ListCredentialsRequest,
-                ListCredentialsResponse, ListForeignNetworkRequest,
+                GetStatsRequest, GetVpnPortalInfoRequest, GetWhitelistRequest,
+                GetWhitelistResponse, InstanceIdentifier, ListConnectorRequest,
+                ListCredentialsRequest, ListCredentialsResponse, ListForeignNetworkRequest,
                 ListGlobalForeignNetworkRequest, ListMappedListenerRequest, ListPeerRequest,
                 ListPeerResponse, ListPortForwardRequest, ListPortForwardResponse,
-                ListRouteRequest, ListRouteResponse, MappedListener, MappedListenerManageRpc,
+                ListPublicIpv6InfoRequest, ListPublicIpv6InfoResponse, ListRouteRequest,
+                ListRouteResponse, MappedListener, MappedListenerManageRpc,
                 MappedListenerManageRpcClientFactory, MetricSnapshot, NodeInfo, PeerInfo,
                 PeerManageRpc, PeerManageRpcClientFactory, PortForwardManageRpc,
                 PortForwardManageRpcClientFactory, RevokeCredentialRequest, Route as ApiRoute,
@@ -142,6 +142,8 @@ enum SubCommand {
     VpnPortal(VpnPortalArgs),
     #[command(about = "inspect self easytier-core status")]
     Node(NodeArgs),
+    #[command(about = "inspect and update saved DNS configuration")]
+    Dns(DnsArgs),
     #[command(about = "manage easytier-core as a system service")]
     Service(ServiceArgs),
     #[command(about = "show tcp/kcp proxy status")]
@@ -200,8 +202,8 @@ struct PeerArgs {
 enum PeerSubCommand {
     /// List connected peers
     List,
-    /// Show subnet exit VPN status
-    Vpn,
+    /// Show public IPv6 address information
+    Ipv6,
     /// List foreign networks discovered by this instance
     ListForeign {
         #[arg(
@@ -305,6 +307,37 @@ enum NodeSubCommand {
     Info,
     #[command(about = "show node config")]
     Config,
+}
+
+#[derive(Args, Debug)]
+struct DnsArgs {
+    #[command(subcommand)]
+    sub_command: DnsSubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DnsSubCommand {
+    /// Show this instance's saved DNS configuration.
+    Show,
+    /// Patch DNS from a file containing only [dns] and [[dns.zone]].
+    Set {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Clear this instance's static records, preserving its default domain.
+    Clear,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsFile {
+    dns: easytier_proto::core_config::DnsConfigRaw,
+}
+
+fn parse_dns_file(contents: &str) -> Result<easytier_proto::core_config::DnsConfigRaw, Error> {
+    let file: DnsFile = toml::from_str(contents)
+        .context("expected a DNS-only TOML file containing [dns] and/or [[dns.zone]]")?;
+    Ok(file.dns)
 }
 
 #[derive(Args, Debug)]
@@ -745,6 +778,53 @@ mod tests {
     use super::*;
     use easytier::proto::api::instance::PeerConnInfo;
 
+    #[test]
+    fn dns_commands_parse_and_files_preserve_clear_semantics() {
+        let cli = Cli::try_parse_from([
+            "easytier-cli",
+            "--instance-name",
+            "mesh",
+            "dns",
+            "set",
+            "--file",
+            "dns.toml",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.sub_command,
+            SubCommand::Dns(DnsArgs {
+                sub_command: DnsSubCommand::Set { .. }
+            })
+        ));
+        let patch = parse_dns_file("[dns]\ndomain = 'mesh.test'\n").unwrap();
+        assert_eq!(patch.domain.as_deref(), Some("mesh.test"));
+        assert!(patch.zone.is_none());
+        let patch = parse_dns_file("[dns]\nzone = []\n").unwrap();
+        assert!(patch.zone.unwrap().items.is_empty());
+        let patch = parse_dns_file(
+            r#"[[dns.zone]]
+origin = "records.test"
+records = [
+    { name = "nas", type = "A", value = "192.0.2.10" },
+    { name = "info", type = "TXT", value = '"literal ; \" \\" "tail"' },
+]
+"#,
+        )
+        .unwrap();
+        easytier_core::config::dns::compile_dns(&patch).unwrap();
+        let records = patch.zone.unwrap().items.remove(0).records.unwrap().items;
+        assert_eq!(
+            records[0].r#type,
+            easytier_proto::core_config::DnsRecordType::A as i32
+        );
+        assert_eq!(
+            records[1].value.as_deref(),
+            Some(r#""literal ; \" \\" "tail""#)
+        );
+        assert!(parse_dns_file("hostname = 'unrelated'\n[dns]\nzone = []").is_err());
+        assert!(parse_dns_file("").is_err());
+    }
+
     const CREDENTIAL_FINGERPRINT: &str =
         "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
 
@@ -1136,6 +1216,12 @@ struct PeerListData {
 struct RouteListData {
     node_info: NodeInfo,
     peer_routes: Vec<PeerRoutePair>,
+}
+
+struct PeerIpv6DataRaw {
+    node_info: NodeInfo,
+    routes: Vec<ApiRoute>,
+    provider_info: ListPublicIpv6InfoResponse,
 }
 
 #[derive(serde::Serialize)]
@@ -1571,17 +1657,25 @@ impl<'a> CommandHandler<'a> {
         })
     }
 
-    async fn fetch_vpn_status(&self) -> Result<GetVpnStatusResponse, Error> {
+    async fn fetch_local_public_ipv6_info(&self) -> Result<ListPublicIpv6InfoResponse, Error> {
         Ok(self
             .get_peer_manager_client()
             .await?
-            .get_vpn_status(
+            .list_public_ipv6_info(
                 BaseController::default(),
-                GetVpnStatusRequest {
+                ListPublicIpv6InfoRequest {
                     instance: Some(self.instance_selector.clone()),
                 },
             )
             .await?)
+    }
+
+    async fn fetch_peer_ipv6_data(&self) -> Result<PeerIpv6DataRaw, Error> {
+        Ok(PeerIpv6DataRaw {
+            node_info: self.fetch_node_info().await?,
+            routes: self.list_routes().await?.routes,
+            provider_info: self.fetch_local_public_ipv6_info().await?,
+        })
     }
 
     async fn fetch_connector_list(&self) -> Result<Vec<Connector>, Error> {
@@ -2000,47 +2094,150 @@ impl<'a> CommandHandler<'a> {
         })
     }
 
-    async fn handle_peer_vpn(&self) -> Result<(), Error> {
+    async fn handle_peer_ipv6(&self) -> Result<(), Error> {
         #[derive(tabled::Tabled, serde::Serialize)]
-        struct VpnRuleRow {
-            cidr: String,
-            exit: String,
-            state: String,
+        struct PeerIpv6NodeRow {
+            peer_id: u32,
+            hostname: String,
+            inst_id: String,
+            ipv4: String,
+            public_ipv6_addr: String,
+            provider_prefix: String,
         }
-        let results = self
-            .collect_instance_results(|handler| Box::pin(handler.fetch_vpn_status()))
-            .await?;
-        if self.verbose || *self.output_format == OutputFormat::Json {
-            return self.print_json_results(results);
+
+        #[derive(tabled::Tabled, serde::Serialize)]
+        struct ProviderLeaseRow {
+            peer_id: u32,
+            inst_id: String,
+            leased_addr: String,
+            valid_until: String,
+            reused: bool,
         }
-        self.print_results(&results, |status| {
-            println!(
-                "vpn enabled: {}  exit_enabled: {}",
-                status.enabled, status.exit_enabled
-            );
-            println!(
-                "routes: active={} installed={}",
-                status.routes_active, status.routes_installed
-            );
-            if !status.activation_error.is_empty() {
-                println!("VPN activation failed: {}", status.activation_error);
-            }
-            let rules = status
-                .rules
-                .iter()
-                .map(|r| VpnRuleRow {
-                    cidr: r.cidr.clone(),
-                    exit: if r.exit_addr.is_empty() {
-                        "exit_nodes".to_owned()
-                    } else {
-                        r.exit_addr.clone()
-                    },
-                    state: r.state.clone(),
+
+        #[derive(serde::Serialize)]
+        struct ProviderLeaseSection {
+            provider_prefix: String,
+            leases: Vec<ProviderLeaseRow>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct PeerIpv6View {
+            nodes: Vec<PeerIpv6NodeRow>,
+            local_provider: Option<ProviderLeaseSection>,
+        }
+
+        fn fmt_ipv6_inet(value: Option<easytier::proto::common::Ipv6Inet>) -> String {
+            value
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        }
+
+        fn fmt_valid_until(unix_seconds: i64) -> String {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(unix_seconds, 0)
+                .map(|ts| {
+                    ts.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
                 })
-                .collect::<Vec<_>>();
-            if !rules.is_empty() {
-                print_output(&rules, self.output_format, &[], &[], self.no_trunc)?;
+                .unwrap_or_else(|| unix_seconds.to_string())
+        }
+
+        let build_view = |data: &PeerIpv6DataRaw| {
+            let mut nodes = Vec::with_capacity(data.routes.len() + 1);
+            nodes.push(PeerIpv6NodeRow {
+                peer_id: data.node_info.peer_id,
+                hostname: data.node_info.hostname.clone(),
+                inst_id: data.node_info.inst_id.clone(),
+                ipv4: data.node_info.ipv4_addr.clone(),
+                public_ipv6_addr: fmt_ipv6_inet(data.node_info.public_ipv6_addr),
+                provider_prefix: fmt_ipv6_inet(data.node_info.ipv6_public_addr_prefix),
+            });
+            nodes.extend(data.routes.iter().map(|route| {
+                PeerIpv6NodeRow {
+                    peer_id: route.peer_id,
+                    hostname: route.hostname.clone(),
+                    inst_id: route.inst_id.clone(),
+                    ipv4: route
+                        .ipv4_addr
+                        .map(|ipv4| ipv4.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    public_ipv6_addr: fmt_ipv6_inet(route.public_ipv6_addr),
+                    provider_prefix: fmt_ipv6_inet(route.ipv6_public_addr_prefix),
+                }
+            }));
+            nodes.sort_by_key(|row| {
+                (
+                    row.peer_id != data.node_info.peer_id,
+                    row.peer_id,
+                    row.inst_id.clone(),
+                )
+            });
+
+            let local_provider = data.provider_info.provider_prefix.map(|provider_prefix| {
+                let mut leases = data
+                    .provider_info
+                    .provider_leases
+                    .iter()
+                    .map(|lease| ProviderLeaseRow {
+                        peer_id: lease.peer_id,
+                        inst_id: lease.inst_id.clone(),
+                        leased_addr: fmt_ipv6_inet(lease.leased_addr),
+                        valid_until: fmt_valid_until(lease.valid_until_unix_seconds),
+                        reused: lease.reused,
+                    })
+                    .collect::<Vec<_>>();
+                leases.sort_by_key(|lease| {
+                    (
+                        lease.peer_id,
+                        lease.inst_id.clone(),
+                        lease.leased_addr.clone(),
+                    )
+                });
+                ProviderLeaseSection {
+                    provider_prefix: provider_prefix.to_string(),
+                    leases,
+                }
+            });
+
+            PeerIpv6View {
+                nodes,
+                local_provider,
             }
+        };
+
+        let results = self
+            .collect_instance_results(|handler| Box::pin(handler.fetch_peer_ipv6_data()))
+            .await?;
+
+        if self.verbose || *self.output_format == OutputFormat::Json {
+            return self.print_json_results(
+                results
+                    .into_iter()
+                    .map(|result| result.map(|data| build_view(&data)))
+                    .collect(),
+            );
+        }
+
+        self.print_results(&results, |data| {
+            let view = build_view(data);
+            print_output(&view.nodes, self.output_format, &[], &[], self.no_trunc)?;
+
+            if let Some(local_provider) = view.local_provider {
+                println!();
+                println!("Local provider prefix: {}", local_provider.provider_prefix);
+                if local_provider.leases.is_empty() {
+                    println!("No active provider leases");
+                } else {
+                    print_output(
+                        &local_provider.leases,
+                        self.output_format,
+                        &[],
+                        &[],
+                        self.no_trunc,
+                    )?;
+                }
+            }
+
             Ok(())
         })
     }
@@ -3188,6 +3385,98 @@ impl<'a> CommandHandler<'a> {
         })
     }
 
+    async fn fetch_dns_config(&self) -> Result<serde_json::Value, Error> {
+        let response = self
+            .get_config_client()
+            .await?
+            .get_config(
+                BaseController::default(),
+                GetConfigRequest {
+                    instance: Some(self.instance_selector.clone()),
+                },
+            )
+            .await?;
+        Ok(serde_json::json!({
+            "dns": response.config.and_then(|config| config.dns),
+        }))
+    }
+
+    async fn handle_dns_show(&self) -> Result<(), Error> {
+        let results = self
+            .collect_instance_results(|handler| Box::pin(handler.fetch_dns_config()))
+            .await?;
+        if *self.output_format == OutputFormat::Json {
+            return self.print_json_results(results);
+        }
+        self.print_results(&results, |state| {
+            println!("{}", serde_json::to_string_pretty(state)?);
+            Ok(())
+        })
+    }
+
+    async fn apply_dns_patch(
+        &self,
+        dns: easytier_proto::core_config::DnsConfigRaw,
+    ) -> Result<(), Error> {
+        let client = self.get_config_client().await?;
+        client
+            .patch_config(
+                BaseController::default(),
+                PatchConfigRequest {
+                    instance: Some(self.instance_selector.clone()),
+                    patch: Some(InstanceConfigPatch {
+                        dns: Some(dns.clone()),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await?;
+        let saved = client
+            .get_config(
+                BaseController::default(),
+                GetConfigRequest {
+                    instance: Some(self.instance_selector.clone()),
+                },
+            )
+            .await?
+            .config
+            .and_then(|config| config.dns)
+            .unwrap_or_default();
+        anyhow::ensure!(
+            (dns.domain.is_none() || dns.domain == saved.domain)
+                && (dns.zone.is_none() || dns.zone == saved.zone),
+            "core did not retain the requested DNS patch; check its version and configuration"
+        );
+        Ok(())
+    }
+
+    async fn handle_dns_patch(
+        &self,
+        dns: easytier_proto::core_config::DnsConfigRaw,
+    ) -> Result<(), Error> {
+        // DNS writes require one instance to avoid a partially successful fanout.
+        if let Some(targets) = self.fanout_targets().await? {
+            anyhow::ensure!(
+                targets.len() == 1,
+                "DNS updates require one instance; specify --instance-id or --instance-name"
+            );
+            self.scoped_to_instance(&targets[0])
+                .apply_dns_patch(dns)
+                .await?;
+        } else {
+            self.apply_dns_patch(dns).await?;
+        }
+        if *self.output_format == OutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::json!({ "saved": true, "requires_restart": true })
+            );
+        } else {
+            println!("DNS configuration saved; restart the instance to apply DNS changes.");
+        }
+        Ok(())
+    }
+
     async fn handle_node(&self, sub_command: Option<&NodeSubCommand>) -> Result<(), Error> {
         let results = self
             .collect_instance_results(|handler| Box::pin(handler.fetch_node_info()))
@@ -3612,8 +3901,8 @@ async fn main() -> Result<(), Error> {
             Some(PeerSubCommand::List) => {
                 handler.handle_peer_list().await?;
             }
-            Some(PeerSubCommand::Vpn) => {
-                handler.handle_peer_vpn().await?;
+            Some(PeerSubCommand::Ipv6) => {
+                handler.handle_peer_ipv6().await?;
             }
             Some(PeerSubCommand::ListForeign { trusted_keys }) => {
                 handler.handle_foreign_network_list(*trusted_keys).await?;
@@ -3716,6 +4005,23 @@ async fn main() -> Result<(), Error> {
         SubCommand::Node(sub_cmd) => {
             handler.handle_node(sub_cmd.sub_command.as_ref()).await?;
         }
+        SubCommand::Dns(args) => match &args.sub_command {
+            DnsSubCommand::Show => handler.handle_dns_show().await?,
+            DnsSubCommand::Set { file } => {
+                let contents = std::fs::read_to_string(file).with_context(|| {
+                    format!("failed to read DNS configuration {}", file.display())
+                })?;
+                handler.handle_dns_patch(parse_dns_file(&contents)?).await?;
+            }
+            DnsSubCommand::Clear => {
+                handler
+                    .handle_dns_patch(easytier_proto::core_config::DnsConfigRaw {
+                        zone: Some(Default::default()),
+                        domain: None,
+                    })
+                    .await?;
+            }
+        },
         SubCommand::Service(service_args) => {
             let service = Service::new(service_args.name)?;
             match service_args.sub_command {

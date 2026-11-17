@@ -30,6 +30,7 @@ use crate::foundation::time::{Duration, timeout};
 
 use super::{
     cleanup_policy::CleanupPolicyPair,
+    fec::{PeerConnFec, PeerConnFecIo},
     peer_conn_liveness::{FEATURE as LIVENESS_ECHO_FEATURE, PeerConnLiveness},
     peer_conn_ping::PeerConnPinger,
     peer_session::{PeerSession, PeerSessionAction},
@@ -61,6 +62,8 @@ use crate::{
         stats::{Throughput, WindowLatency},
     },
 };
+
+mod extensions;
 
 pub type PeerConnId = uuid::Uuid;
 
@@ -312,6 +315,7 @@ pub struct PeerConn {
     throughput: Arc<Throughput>,
     loss_rate_stats: Arc<AtomicU32>,
     liveness: PeerConnLiveness,
+    fec: Option<Arc<PeerConnFec>>,
 
     peer_session_store: Arc<PeerSessionStore>,
     my_encrypt_algo: String,
@@ -374,10 +378,22 @@ impl PeerConn {
         let liveness = PeerConnLiveness::new();
         let filter_chain = TunnelFilterChain::new(session_filter.clone(), peer_conn_tunnel_filter)
             .chain(liveness.clone());
-        let peer_conn_tunnel = TunnelWithFilter::new(tunnel, filter_chain);
-        let mut mpsc_tunnel = MpscTunnel::new(peer_conn_tunnel, Some(Duration::from_secs(7)));
-
-        let (recv, sink) = (mpsc_tunnel.get_stream(), mpsc_tunnel.get_sink());
+        let fec = tunnel_info
+            .as_ref()
+            .is_some_and(|info| info.tunnel_type == "udp")
+            .then(|| Arc::new(PeerConnFec::new(&flags, context.udp_fec_metrics())));
+        let (recv, sink, tunnel_owner): (_, _, Box<dyn Any + Send>) = if let Some(fec) = &fec {
+            let mut io = PeerConnFecIo::new(tunnel, filter_chain, fec.clone());
+            (io.get_stream(), io.get_sink(), Box::new(io))
+        } else {
+            let peer_conn_tunnel = TunnelWithFilter::new(tunnel, filter_chain);
+            let mut mpsc_tunnel = MpscTunnel::new(peer_conn_tunnel, Some(Duration::from_secs(7)));
+            (
+                mpsc_tunnel.get_stream(),
+                mpsc_tunnel.get_sink(),
+                Box::new(guard!([mut mpsc_tunnel] mpsc_tunnel.close())),
+            )
+        };
 
         let my_encrypt_algo = flags.encryption_algorithm;
 
@@ -401,10 +417,7 @@ impl PeerConn {
             session_filter,
             noise_handshake_result: None,
 
-            tunnel: Arc::new(Mutex::new(
-                Box::new(guard!([mut mpsc_tunnel] mpsc_tunnel.close()))
-                    as Box<dyn Any + Send + 'static>,
-            )),
+            tunnel: Arc::new(Mutex::new(tunnel_owner)),
             sink,
             recv: Mutex::new(Some(recv)),
             tunnel_info,
@@ -423,10 +436,19 @@ impl PeerConn {
             throughput,
             loss_rate_stats: Arc::new(AtomicU32::new(0)),
             liveness,
+            fec,
 
             peer_session_store,
             my_encrypt_algo,
         }
+    }
+
+    fn local_features(&self) -> Vec<String> {
+        let mut features = vec![LIVENESS_ECHO_FEATURE.to_owned()];
+        if let Some(fec) = &self.fec {
+            features.extend_from_slice(fec.local_features());
+        }
+        features
     }
 
     fn get_peer_session_store(&self) -> &Arc<PeerSessionStore> {
@@ -477,45 +499,6 @@ impl PeerConn {
             | PeerConnectionOrigin::UdpHolePunch
             | PeerConnectionOrigin::Attached => Duration::from_secs(32),
         }
-    }
-
-    pub(crate) fn origin(&self) -> PeerConnectionOrigin {
-        self.origin
-    }
-
-    pub(crate) fn cleanup_policy(&self) -> &CleanupPolicyPair {
-        &self.cleanup_policy
-    }
-
-    pub(crate) fn is_manual(&self) -> bool {
-        self.cleanup_policy.is_manual()
-    }
-
-    fn handshake_features(&self) -> Vec<String> {
-        #[cfg(test)]
-        if let Some(features) = &self.handshake_features_override {
-            return features.clone();
-        }
-        let mut features = vec![LIVENESS_ECHO_FEATURE.to_owned()];
-        features.push(self.local_parallel_offer().feature());
-        features.push(format!("p2p-tx-v1:{}", self.parallel_tx_epoch));
-        if let Some(member) = &self.parallel_member {
-            features.push(member.feature());
-        }
-        if let Some(feature) = self.cleanup_policy.feature() {
-            features.push(feature);
-        }
-        features
-    }
-
-    #[cfg(test)]
-    pub(crate) fn override_handshake_features(&mut self, features: Vec<String>) {
-        self.handshake_features_override = Some(features);
-    }
-
-    /// Whether a verified, preferred P2P connection may replace this one.
-    pub(crate) fn can_retire_as_redundant(&self) -> bool {
-        self.cleanup_policy.can_retire_automatic()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -597,6 +580,7 @@ impl PeerConn {
         &self,
         send_secret_digest: bool,
         metric_network_name: &str,
+        network_name_override: Option<String>,
     ) -> Result<(), Error> {
         let network = self.context.network_identity();
         let mut req = HandshakeRequest {
@@ -604,7 +588,7 @@ impl PeerConn {
             my_peer_id: self.my_peer_id,
             version: VERSION,
             features: self.handshake_features(),
-            network_name: network.network_name.clone(),
+            network_name: network_name_override.unwrap_or_else(|| network.network_name.clone()),
             ..Default::default()
         };
 
@@ -1107,7 +1091,20 @@ impl PeerConn {
         handshake_recved(self, &remote_network_name)?;
 
         let server_network_name = self.context.network_name();
-        let (role_hint, secret_proof_32) = if msg1_pb.a_network_name == server_network_name {
+        let name_matches = msg1_pb.a_network_name == server_network_name;
+        // Reply with our real name only to a peer that already declared it (the
+        // normal same-network join). Any other peer gets an echo of its own declared
+        // name instead: msg2 is sent before the secret proof in msg3 is verified, so
+        // it must not disclose ours.
+        // The "fg-" prefix keeps the echo from ever matching the peer's own name,
+        // which would trip the peer-side check that a matching name requires
+        // role_hint == 1.
+        let b_network_name_for_reply = if name_matches {
+            server_network_name.clone()
+        } else {
+            format!("fg-{}", msg1_pb.a_network_name)
+        };
+        let (role_hint, secret_proof_32) = if name_matches {
             (
                 1,
                 self.context
@@ -1135,7 +1132,7 @@ impl PeerConn {
 
         let b_conn_id = uuid::Uuid::new_v4();
         let msg2_pb = PeerConnNoiseMsg2Pb {
-            b_network_name: server_network_name,
+            b_network_name: b_network_name_for_reply,
             role_hint,
             action: match action {
                 PeerSessionAction::Join => PeerConnSessionActionPb::Join as i32,
@@ -1295,8 +1292,25 @@ impl PeerConn {
             self.is_client = Some(false);
 
             let send_digest = self.get_network_identity() == self.context.network_identity();
-            self.send_handshake(send_digest, &self.get_network_identity().network_name)
-                .await?;
+            // Same rule as the noise msg2 path: reply with the real name only to a
+            // peer that already declared it, echo from the peer's own name otherwise.
+            let my_name = self.context.network_identity().network_name;
+            let peer_name = self
+                .info
+                .as_ref()
+                .map(|i| i.network_name.clone())
+                .unwrap_or_default();
+            let reply_name = if peer_name == my_name {
+                None
+            } else {
+                Some(format!("fg-{}", peer_name))
+            };
+            self.send_handshake(
+                send_digest,
+                &self.get_network_identity().network_name,
+                reply_name,
+            )
+            .await?;
         } else {
             return Err(Error::WaitRespError(format!(
                 "unexpected packet type during handshake: {}",
@@ -1308,6 +1322,9 @@ impl PeerConn {
             .set_remote_features(&self.info.as_ref().unwrap().features);
         self.cleanup_policy
             .set_remote_features(&self.info.as_ref().unwrap().features);
+        if let Some(fec) = &self.fec {
+            fec.set_remote_features(&self.info.as_ref().unwrap().features);
+        }
 
         if self.get_peer_id() == self.my_peer_id {
             Err(Error::WaitRespError("peer id conflict".to_owned()))
@@ -1329,7 +1346,8 @@ impl PeerConn {
             self.is_client = Some(true);
         } else {
             let network = self.context.network_identity();
-            self.send_handshake(true, &network.network_name).await?;
+            self.send_handshake(true, &network.network_name, None)
+                .await?;
             tracing::info!("waiting for handshake request from server");
             let rsp = self.wait_handshake_loop().await?;
             tracing::info!("handshake response: {:?}", rsp);
@@ -1341,6 +1359,9 @@ impl PeerConn {
             .set_remote_features(&self.info.as_ref().unwrap().features);
         self.cleanup_policy
             .set_remote_features(&self.info.as_ref().unwrap().features);
+        if let Some(fec) = &self.fec {
+            fec.set_remote_features(&self.info.as_ref().unwrap().features);
+        }
 
         if self.get_peer_id() == self.my_peer_id {
             Err(Error::WaitRespError(
@@ -1427,13 +1448,14 @@ impl PeerConn {
                         if !parallel_supported || parallel_receiver.is_none() {
                             continue;
                         }
-                        let Some((epoch, seq, inner)) =
+                        let Some((epoch, seq, prev, inner)) =
                             super::parallel::unwrap(zc_packet, remote_peer_id, my_peer_id)
                         else {
+                            super::parallel::drops::bump(super::parallel::drops::UNWRAP);
                             continue;
                         };
                         zc_packet = inner;
-                        Some((epoch, seq))
+                        Some((epoch, seq, prev))
                     } else {
                         None
                     };
@@ -1442,13 +1464,14 @@ impl PeerConn {
                         && let Some(limiter) = recv_limiter.as_ref()
                         && !limiter.try_consume(payload_len)
                     {
+                        super::parallel::drops::bump(super::parallel::drops::LIMITER);
                         continue;
                     }
-                    if let Some((epoch, seq)) = parallel_sequence {
+                    if let Some((epoch, seq, prev)) = parallel_sequence {
                         parallel_receiver
                             .as_ref()
                             .unwrap()
-                            .receive(epoch, seq, zc_packet, ingress)
+                            .receive(epoch, seq, prev, zc_packet, ingress)
                             .await;
                         continue;
                     }
@@ -1467,19 +1490,14 @@ impl PeerConn {
                             decode_window_report(zc_packet.payload(), false)
                         {
                             throughput.record_peer_traffic_report(
-                                remote_report.version,
-                                remote_report.report.rx_bps,
-                                remote_report.report.estimated_tx_bps,
-                                remote_report.report.sample_window,
+                                remote_report.rx_bps,
+                                remote_report.estimated_tx_bps,
+                                remote_report.sample_window,
                             );
                             let seq =
                                 u32::from_le_bytes(zc_packet.payload()[..4].try_into().unwrap());
-                            let reply = encode_window_report(
-                                seq,
-                                throughput.traffic_report(),
-                                true,
-                                remote_report.version,
-                            );
+                            let reply =
+                                encode_window_report(seq, throughput.traffic_report(), true);
                             zc_packet.mut_payload().copy_from_slice(&reply);
                         }
                         if let Err(e) = sink.send(zc_packet).await {
@@ -1554,120 +1572,6 @@ impl PeerConn {
         Ok(())
     }
 
-    pub(crate) fn set_parallel_receiver(
-        &mut self,
-        receiver: Arc<super::parallel::ParallelReceiver>,
-    ) {
-        receiver.register_lane(
-            self.conn_id,
-            self.tunnel_info
-                .as_ref()
-                .is_some_and(|tunnel| super::parallel::ordered_transport(&tunnel.tunnel_type)),
-        );
-        self.parallel_receiver = Some(receiver);
-    }
-
-    pub(crate) fn set_parallel_policy(&mut self, policy: Arc<super::parallel::ParallelPolicy>) {
-        policy.handshake(super::parallel::remote_offer(
-            &self.info.as_ref().unwrap().features,
-        ));
-        self.parallel_policy = Some(policy);
-    }
-
-    pub(crate) fn parallel_can_trim(&self) -> bool {
-        self.parallel_policy
-            .as_ref()
-            .is_some_and(|policy| policy.can_trim(self.local_parallel_offer()))
-    }
-
-    pub(crate) fn set_parallel_foreign(&mut self) {
-        self.parallel_foreign = true;
-    }
-
-    pub(crate) fn local_parallel_offer(&self) -> super::parallel::ParallelOffer {
-        let mut offer = super::parallel::ParallelOffer::local(self.context.as_ref());
-        if self.parallel_foreign {
-            offer.limit = offer.limit.min(
-                self.context
-                    .max_direct_conns_per_peer_in_foreign_network()
-                    .clamp(1, 16) as u32,
-            );
-        }
-        offer
-    }
-
-    pub(crate) fn parallel_connection_limit(&self) -> u32 {
-        self.local_parallel_offer().limit.min(
-            self.parallel_policy
-                .as_ref()
-                .and_then(|policy| policy.remote())
-                .or_else(|| super::parallel::remote_offer(&self.info.as_ref().unwrap().features))
-                .map_or(16, |offer| offer.limit),
-        )
-    }
-
-    pub(crate) fn parallel_member(&self) -> Option<&super::parallel::ParallelMemberToken> {
-        self.parallel_member.as_ref()
-    }
-
-    pub(crate) fn parallel_tx_epoch(&self) -> uuid::Uuid {
-        self.parallel_tx_epoch
-    }
-
-    pub(crate) fn parallel_target(&self) -> u32 {
-        let features = &self.info.as_ref().unwrap().features;
-        let Some(handshake_offer) = super::parallel::remote_offer(features) else {
-            return 1;
-        };
-        if super::parallel::tx_epoch(features).is_none() {
-            return 1;
-        }
-        if self.is_attached()
-            || self.tunnel_info.as_ref().is_none_or(|t| {
-                matches!(
-                    t.tunnel_type.rsplit('-').next(),
-                    Some("ring" | "virtualrelay")
-                )
-            })
-        {
-            return 1;
-        }
-        if self.parallel_member.is_some()
-            && super::parallel::ParallelMemberToken::from_features(
-                &self.info.as_ref().unwrap().features,
-            )
-            .as_ref()
-                != self.parallel_member.as_ref()
-        {
-            return 1;
-        }
-        let remote = self
-            .parallel_policy
-            .as_ref()
-            .and_then(|policy| policy.remote())
-            .unwrap_or(handshake_offer);
-        self.local_parallel_offer().target(remote)
-    }
-
-    /// Upload rate measured from what the peer reported receiving; zero
-    /// until this connection has carried enough recent traffic.
-    pub(crate) fn delivered_tx_bps(&self) -> u64 {
-        self.throughput.delivered_tx_bps()
-    }
-
-    pub(crate) fn try_send_owned(
-        &self,
-        msg: ZCPacket,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<ZCPacket>> {
-        self.sink.try_send_owned(msg)
-    }
-
-    pub(crate) async fn reserve_send(
-        &self,
-    ) -> Result<tokio::sync::mpsc::OwnedPermit<ZCPacket>, TunnelError> {
-        self.sink.reserve_owned().await
-    }
-
     pub fn get_peer_id(&self) -> PeerId {
         self.info.as_ref().unwrap().my_peer_id
     }
@@ -1730,6 +1634,7 @@ impl PeerConn {
     }
 
     pub fn get_stats(&self) -> PeerConnStats {
+        let (current_tx_bps, current_rx_bps) = self.throughput.current_bps();
         PeerConnStats {
             latency_us: self.latency_stats.get_latency_us(),
 
@@ -1741,6 +1646,8 @@ impl PeerConn {
             estimated_rx_bps: self.throughput.estimated_rx_bps(),
             estimated_tx_bps: self.throughput.estimated_tx_bps(),
             bandwidth_estimate_version: BANDWIDTH_ESTIMATE_VERSION,
+            current_rx_bps: Some(current_rx_bps),
+            current_tx_bps: Some(current_tx_bps),
         }
     }
 
@@ -1753,7 +1660,9 @@ impl PeerConn {
             features: info.features.clone(),
             tunnel: self.tunnel_info.clone(),
             stats: Some(self.get_stats()),
+            fec: self.fec.as_ref().map(|fec| fec.stats()),
             loss_rate: (f64::from(self.loss_rate_stats.load(Ordering::Relaxed)) / 100.0) as f32,
+            link_loss_rate: self.throughput.link_loss_rate(),
             is_client: self.is_client.unwrap_or_default(),
             network_name: info.network_name.clone(),
             is_closed: self.close_event_notifier.is_closed(),
@@ -1808,32 +1717,18 @@ impl Drop for PeerConn {
 }
 
 #[cfg(test)]
+#[path = "peer_conn_fec_tests.rs"]
+mod fec_tests;
+
+#[cfg(test)]
 mod tests {
+    use super::extensions::cleanup_handshake_context;
     use super::*;
     use crate::{
         peers::{context::PeerContext, test_support::NoopPeerContext},
         proto::common::Flags,
         tunnel::ring::create_ring_tunnel_pair,
     };
-
-    fn cleanup_handshake_context(key: u8, secure: bool, flags: Flags) -> ArcPeerContext {
-        let mut context = NoopPeerContext::new(NetworkIdentity {
-            network_name: "cleanup-handshake".to_owned(),
-            network_secret: Some("cleanup-secret".to_owned()),
-            network_secret_digest: None,
-        })
-        .with_flags(flags);
-        if secure {
-            let private = x25519_dalek::StaticSecret::from([key; 32]);
-            let public = x25519_dalek::PublicKey::from(&private);
-            context = context.with_secure_mode(SecureModeConfig {
-                enabled: true,
-                local_private_key: Some(BASE64_STANDARD.encode(private.as_bytes())),
-                local_public_key: Some(BASE64_STANDARD.encode(public.as_bytes())),
-            });
-        }
-        Arc::new(context)
-    }
 
     struct ForeignOfferContext(ArcPeerContext);
     impl PeerContext for ForeignOfferContext {

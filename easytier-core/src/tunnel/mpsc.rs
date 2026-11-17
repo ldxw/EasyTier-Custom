@@ -17,6 +17,10 @@ use crate::{
 pub struct MpscTunnelSender(Sender<ZCPacket>);
 
 impl MpscTunnelSender {
+    pub(crate) fn new(sender: Sender<ZCPacket>) -> Self {
+        Self(sender)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sender(sender: Sender<ZCPacket>) -> Self {
         Self(sender)
@@ -34,6 +38,13 @@ impl MpscTunnelSender {
     /// Keep ownership on congestion so a striped packet can try another path.
     pub fn try_send_owned(&self, item: ZCPacket) -> Result<(), TrySendError<ZCPacket>> {
         self.0.try_send(item)
+    }
+    pub fn try_reserve(&self) -> Option<tokio::sync::mpsc::Permit<'_, ZCPacket>> {
+        self.0.try_reserve().ok()
+    }
+    /// Free send slots right now, for diagnostics.
+    pub fn free_capacity(&self) -> usize {
+        self.0.capacity()
     }
     pub async fn send(&self, item: ZCPacket) -> Result<(), TunnelError> {
         match self.0.try_send(item) {

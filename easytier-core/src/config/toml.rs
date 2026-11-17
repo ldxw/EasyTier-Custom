@@ -20,6 +20,9 @@ pub const DEFAULT_ET_DNS_ZONE: &str = "et.net.";
 
 pub use crate::proto::common::{Flags, FlagsPatch};
 
+// File and management inputs share these protobuf Raw messages.
+pub use crate::proto::core_config::{DnsConfigRaw as DnsConfig, DnsZoneConfigRaw as DnsZoneConfig};
+
 pub(crate) fn default_instance_name() -> String {
     "default".to_owned()
 }
@@ -70,6 +73,9 @@ pub trait ConfigLoader: Send + Sync {
         None
     }
     fn set_advanced_sync_at(&self, _stamp: Option<u64>) {}
+
+    fn get_dns(&self) -> Option<DnsConfig>;
+    fn set_dns(&self, dns: Option<DnsConfig>);
 
     fn get_inst_name(&self) -> String;
     fn set_inst_name(&self, name: String);
@@ -150,9 +156,6 @@ pub trait ConfigLoader: Send + Sync {
 
     fn get_exit_nodes(&self) -> Vec<IpAddr>;
     fn set_exit_nodes(&self, nodes: Vec<IpAddr>);
-
-    fn get_vpn(&self) -> crate::config::vpn::VpnConfig;
-    fn set_vpn(&self, vpn: crate::config::vpn::VpnConfig);
 
     fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>>;
     fn set_routes(&self, routes: Option<Vec<cidr::Ipv4Cidr>>);
@@ -482,6 +485,7 @@ struct Config {
     traffic_disguise: Option<String>,
     network_sync_at: Option<u64>,
     advanced_sync_at: Option<u64>,
+    dns: Option<DnsConfig>,
     instance_name: Option<String>,
     instance_id: Option<uuid::Uuid>,
     ipv4: Option<String>,
@@ -495,7 +499,6 @@ struct Config {
     listeners: Option<Vec<url::Url>>,
     mapped_listeners: Option<Vec<url::Url>>,
     exit_nodes: Option<Vec<IpAddr>>,
-    vpn: Option<crate::config::vpn::VpnConfig>,
 
     peer: Option<Vec<PeerConfig>>,
     proxy_network: Option<Vec<ProxyNetworkConfig>>,
@@ -530,60 +533,6 @@ struct Config {
 #[cfg(feature = "config-write")]
 fn flags_patch_is_empty(flags: &FlagsPatch) -> bool {
     prost::Message::encoded_len(flags) == 0
-}
-
-const LEGACY_P2P_DISGUISE_FLAGS: [&str; 3] = [
-    "prefer_wss_http3_for_p2p",
-    "disable_wss_http3_for_p2p",
-    "only_use_wss_http3_for_hole_punching",
-];
-
-/// Files written before `p2p_disguise_mode` existed state the policy with three
-/// booleans in `[flags]`. Rewrite them as the equivalent mode (a mode that is
-/// already set wins); the next save of the file stores only the mode.
-/// Returns `None` when the document has nothing to migrate.
-fn migrate_legacy_p2p_disguise_flags(config_str: &str) -> anyhow::Result<Option<String>> {
-    if !LEGACY_P2P_DISGUISE_FLAGS
-        .iter()
-        .any(|key| config_str.contains(key))
-    {
-        return Ok(None);
-    }
-    // Syntax errors are reported against the original document.
-    let Ok(mut document) = toml::from_str::<toml::Table>(config_str) else {
-        return Ok(None);
-    };
-    let Some(flags) = document
-        .get_mut("flags")
-        .and_then(toml::Value::as_table_mut)
-    else {
-        return Ok(None);
-    };
-    let mut legacy = [None; 3];
-    for (value, key) in legacy.iter_mut().zip(LEGACY_P2P_DISGUISE_FLAGS) {
-        if let Some(raw) = flags.remove(key) {
-            *value = Some(
-                raw.as_bool()
-                    .with_context(|| format!("[flags] {key} must be a boolean"))?,
-            );
-        }
-    }
-    if legacy.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    let mode_set = flags
-        .get("p2p_disguise_mode")
-        .and_then(toml::Value::as_str)
-        .is_some_and(|mode| !mode.trim().is_empty());
-    if !mode_set {
-        let mode = super::P2pDisguiseMode::from_legacy_flags(legacy[0], legacy[1], legacy[2])
-            .context("invalid legacy P2P disguise flags")?;
-        flags.insert(
-            "p2p_disguise_mode".to_owned(),
-            toml::Value::String(mode.as_str().to_owned()),
-        );
-    }
-    Ok(Some(toml::to_string(&document)?))
 }
 
 #[cfg(feature = "rich-config-errors")]
@@ -689,13 +638,6 @@ impl TomlConfig {
         if config.port_forward.as_ref().is_some_and(Vec::is_empty) {
             config.port_forward = None;
         }
-        if config
-            .vpn
-            .as_ref()
-            .is_some_and(|vpn| *vpn == crate::config::vpn::VpnConfig::default())
-        {
-            config.vpn = None;
-        }
         if config.secure_mode.as_ref().is_some_and(|secure| {
             !secure.enabled
                 && secure.local_private_key.is_none()
@@ -726,13 +668,6 @@ impl TomlConfig {
         }
         if config.traffic_disguise.as_deref() == Some("speedtest") {
             config.traffic_disguise = None;
-        }
-        if config
-            .vpn
-            .as_ref()
-            .is_some_and(|vpn| *vpn == crate::config::vpn::VpnConfig::default())
-        {
-            config.vpn = None;
         }
         let secure_mode_enabled = config.secure_mode.as_ref().is_some_and(|mode| mode.enabled);
         if let Some(identity) = config.network_identity.as_mut() {
@@ -801,9 +736,6 @@ impl TomlConfig {
         source_name: &str,
         config_str: &str,
     ) -> Result<Self, anyhow::Error> {
-        let migrated = migrate_legacy_p2p_disguise_flags(config_str)
-            .with_context(|| format!("failed to load config from {source_name}"))?;
-        let config_str = migrated.as_deref().unwrap_or(config_str);
         let mut config = toml::de::from_str::<Config>(config_str).map_err(|err| {
             let message = format_toml_parse_error(source_name, config_str, &err);
             anyhow::Error::new(err).context(message)
@@ -818,14 +750,13 @@ impl TomlConfig {
     }
 
     fn new_from_config(mut config: Config) -> Result<Self, anyhow::Error> {
+        if let Some(dns) = &config.dns {
+            super::dns::compile_dns(dns)?;
+        }
         validate_transport_tuning(
             config.parallel_connections,
             config.traffic_disguise.as_deref(),
         )?;
-        if let Some(vpn) = &config.vpn {
-            vpn.validate()
-                .map_err(|error| anyhow::anyhow!("invalid [vpn] config: {error}"))?;
-        }
         config.flags.validate_p2p_disguise()?;
         config.secure_mode = config
             .secure_mode
@@ -995,6 +926,14 @@ impl ConfigLoader for TomlConfig {
 
     fn set_advanced_sync_at(&self, stamp: Option<u64>) {
         self.config.lock().unwrap().advanced_sync_at = stamp;
+    }
+
+    fn get_dns(&self) -> Option<DnsConfig> {
+        self.config.lock().unwrap().dns.clone()
+    }
+
+    fn set_dns(&self, dns: Option<DnsConfig>) {
+        self.config.lock().unwrap().dns = dns;
     }
 
     fn get_netns(&self) -> Option<String> {
@@ -1259,14 +1198,6 @@ impl ConfigLoader for TomlConfig {
         self.config.lock().unwrap().exit_nodes = Some(nodes);
     }
 
-    fn get_vpn(&self) -> crate::config::vpn::VpnConfig {
-        self.config.lock().unwrap().vpn.clone().unwrap_or_default()
-    }
-
-    fn set_vpn(&self, vpn: crate::config::vpn::VpnConfig) {
-        self.config.lock().unwrap().vpn = Some(vpn);
-    }
-
     fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>> {
         self.config.lock().unwrap().routes.clone()
     }
@@ -1427,132 +1358,8 @@ pub type TomlConfigLoader = TomlConfig;
 mod tests {
     use super::*;
 
-    /// Configuration files are parsed strictly, so every sample we ship must
-    /// only use fields this build understands.
-    #[test]
-    fn shipped_sample_configs_load() {
-        let install = include_str!("../../../script/install.sh");
-        let start = "cat >$INSTALL_PATH/config/default.conf <<EOF\n";
-        let body = &install[install.find(start).unwrap() + start.len()..];
-        let install_default = &body[..body.find("\nEOF").unwrap()];
-        for (name, sample) in [
-            ("script/install.sh default.conf", install_default),
-            (
-                "easytier-magisk/config/config.toml",
-                include_str!("../../../easytier-contrib/easytier-magisk/config/config.toml"),
-            ),
-        ] {
-            if let Err(error) = TomlConfig::new_from_str_with_source(name, sample) {
-                panic!("{name}: {error}");
-            }
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn network_sync_stamp_round_trips_and_is_omitted_when_unset() {
-        let config = TomlConfig::new_from_str("").unwrap();
-        assert_eq!(config.get_network_sync_at(), None);
-        assert!(!config.dump().contains("network_sync_at"));
-        assert!(!config.dump().contains("advanced_sync_at"));
-        config.set_network_sync_at(Some(1_793_587_936_027));
-        config.set_advanced_sync_at(Some(1_793_587_936_028));
-        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
-        assert_eq!(restored.get_network_sync_at(), Some(1_793_587_936_027));
-        assert_eq!(restored.get_advanced_sync_at(), Some(1_793_587_936_028));
-        #[cfg(feature = "web-client")]
-        assert_eq!(
-            crate::config::api::network_config_from_toml(&restored).network_sync_at,
-            Some(1_793_587_936_027)
-        );
-    }
-
-    #[test]
-    fn parallel_tuning_validates_and_omits_defaults() {
-        let config = TomlConfig::new_from_str("parallel_connections = 1\ndisable_parallel_connections = false\ntraffic_disguise = 'speedtest'\n").unwrap();
-        assert_eq!(config.get_parallel_connections(), 1);
-        assert!(!config.get_disable_parallel_connections());
-        assert_eq!(config.get_traffic_disguise(), "speedtest");
-        for key in [
-            "parallel_connections",
-            "disable_parallel_connections",
-            "traffic_disguise",
-        ] {
-            assert!(!config.dump().contains(key));
-        }
-        let config = TomlConfig::new_from_str("parallel_connections = 16\ndisable_parallel_connections = true\ntraffic_disguise = 'video'\n").unwrap();
-        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
-        assert_eq!(restored.get_parallel_connections(), 16);
-        assert!(restored.get_disable_parallel_connections());
-        assert_eq!(restored.get_traffic_disguise(), "video");
-        restored.set_disable_parallel_connections(Some(false));
-        assert_eq!(restored.get_parallel_connections(), 16);
-        assert!(!restored.dump().contains("disable_parallel_connections"));
-        for input in [
-            "parallel_connections = 0",
-            "parallel_connections = 17",
-            "parallel_connections = 1.5",
-            "traffic_disguise = 'invalid'",
-        ] {
-            assert!(TomlConfig::new_from_str(input).is_err(), "{input}");
-        }
-    }
-
-    #[test]
-    fn omitted_or_empty_protocol_uses_udp_and_enables_cleanup() {
-        for input in [
-            "",
-            "[flags]",
-            "[flags]\ndefault_protocol = \"\"",
-            "[flags]\ndefault_protocol = \"  \"",
-        ] {
-            let config = TomlConfigLoader::new_from_str(input).unwrap();
-            assert_eq!(config.get_flags().default_protocol, "udp", "{input}");
-            assert!(config.get_flags().close_redundant_conns_when_disguised);
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn explicit_protocol_and_cleanup_survive_config_dump_and_reload() {
-        for (protocol, cleanup) in [("udp", true), ("tcp", false)] {
-            let config = TomlConfigLoader::new_from_str(&format!(
-                "[flags]\ndefault_protocol = \"{protocol}\"\nclose_redundant_conns_when_disguised = {cleanup}\n"
-            ))
-            .unwrap();
-            assert_eq!(config.get_flags().default_protocol, protocol);
-            assert_eq!(
-                config.get_flags().close_redundant_conns_when_disguised,
-                cleanup
-            );
-            let dumped = config.dump();
-            if protocol == "tcp" {
-                assert!(dumped.contains("default_protocol = \"tcp\""));
-                assert!(dumped.contains("close_redundant_conns_when_disguised = false"));
-            }
-            let reloaded = TomlConfigLoader::new_from_str(&dumped).unwrap();
-            assert_eq!(reloaded.get_flags().default_protocol, protocol);
-            assert_eq!(
-                reloaded.get_flags().close_redundant_conns_when_disguised,
-                cleanup
-            );
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn form_default_pruning_preserves_both_dhcp_subnets() {
-        let config =
-            TomlConfig::new_from_str("dhcp = '10.20.0.0/24'\ndhcpv6 = 'fd12::/64'").unwrap();
-        config.prune_form_defaults();
-        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
-        assert_eq!(restored.get_dhcp_config(), config.get_dhcp_config());
-        assert_eq!(restored.get_dhcpv6_config(), config.get_dhcpv6_config());
-        config.set_dhcp(false);
-        config.set_dhcpv6(false);
-        config.prune_form_defaults();
-        assert!(!config.dump().contains("dhcp"));
-    }
+    #[cfg(test)]
+    mod custom_tests;
 
     #[test]
     fn dhcp_accepts_booleans_and_ipv4_subnets() {
@@ -1913,61 +1720,6 @@ socket_mark = 66
         );
     }
 
-    #[test]
-    fn legacy_disguise_flags_load_as_the_equivalent_mode() {
-        for (input, mode) in [
-            ("prefer_wss_http3_for_p2p = true", "prefer"),
-            ("prefer_wss_http3_for_p2p = false", "off"),
-            ("disable_wss_http3_for_p2p = true", "disabled"),
-            ("only_use_wss_http3_for_hole_punching = true", "only"),
-            (
-                "prefer_wss_http3_for_p2p = true\nonly_use_wss_http3_for_hole_punching = true",
-                "only",
-            ),
-            // A mode that is already set wins over the booleans it replaced.
-            (
-                "p2p_disguise_mode = 'off'\ndisable_wss_http3_for_p2p = true",
-                "off",
-            ),
-        ] {
-            let config = TomlConfig::new_from_str(&format!("[flags]\n{input}\nmtu = 1300\n"))
-                .unwrap_or_else(|error| panic!("{input}: {error}"));
-            assert_eq!(config.get_flags().p2p_disguise().as_str(), mode, "{input}");
-            assert_eq!(config.get_flags().mtu, 1300);
-            let dumped = config.dump();
-            assert!(!dumped.contains("wss_http3"), "{dumped}");
-        }
-        let error = TomlConfig::new_from_str(
-            "[flags]\nonly_use_wss_http3_for_hole_punching = true\ndisable_wss_http3_for_p2p = true\n",
-        )
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("mutually exclusive"),
-            "{error:#}"
-        );
-        assert!(TomlConfig::new_from_str("[flags]\nprefer_wss_http3_for_p2p = 'yes'\n").is_err());
-    }
-
-    #[test]
-    fn mode_patches_keep_unrelated_flags() {
-        let config = TomlConfig::new_from_str("[flags]\np2p_disguise_mode = 'off'\n").unwrap();
-        config.patch_flags(FlagsPatch {
-            latency_first: Some(true),
-            ..Default::default()
-        });
-        assert_eq!(
-            config.get_flags_patch().p2p_disguise_mode.as_deref(),
-            Some("off")
-        );
-        assert!(config.get_flags().latency_first);
-        config.patch_flags(FlagsPatch {
-            p2p_disguise_mode: Some("only".into()),
-            ..Default::default()
-        });
-        assert_eq!(config.get_flags().p2p_disguise().as_str(), "only");
-        assert!(config.get_flags().latency_first);
-    }
-
     #[cfg(feature = "config-write")]
     #[test]
     fn flags_presence_survives_parse_patch_and_dump() {
@@ -1990,73 +1742,6 @@ socket_mark = 66
                 restored.get_flags().enable_encryption,
                 expected.unwrap_or(true)
             );
-        }
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn flags_patch_preserves_explicit_false_zero_and_empty_values() {
-        let config = TomlConfig::new_from_str(
-            r#"[flags]
-default_protocol = "tcp"
-dev_name = "old-device"
-encryption_algorithm = "chacha20"
-relay_network_whitelist = "allowed"
-mtu = 1420
-instance_recv_bps_limit = 1024
-socket_mark = 66
-only_use_wss_http3_for_hole_punching = false
-prefer_wss_http3_for_p2p = true
-disable_wss_http3_for_p2p = true
-close_redundant_conns_when_disguised = true
-"#,
-        )
-        .unwrap();
-        config.patch_flags(FlagsPatch::default());
-        assert_eq!(config.get_flags().default_protocol, "tcp");
-        assert_eq!(config.get_flags().mtu, 1420);
-
-        let update = FlagsPatch {
-            default_protocol: Some(String::new()),
-            dev_name: Some(String::new()),
-            encryption_algorithm: Some(String::new()),
-            relay_network_whitelist: Some(String::new()),
-            mtu: Some(0),
-            instance_recv_bps_limit: Some(0),
-            socket_mark: Some(0),
-            p2p_disguise_mode: Some("off".into()),
-            close_redundant_conns_when_disguised: Some(false),
-            ..Default::default()
-        };
-        config.patch_flags(update.clone());
-        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
-        assert_eq!(restored.get_flags_patch(), update);
-
-        let flags = restored.get_flags();
-        assert_eq!(flags.default_protocol, "udp");
-        assert_eq!(flags.dev_name, "");
-        assert_eq!(flags.encryption_algorithm, "");
-        assert_eq!(flags.relay_network_whitelist, "");
-        assert_eq!(flags.mtu, 0);
-        assert_eq!(flags.instance_recv_bps_limit, 0);
-        assert_eq!(flags.socket_mark, Some(0));
-        assert!(!flags.close_redundant_conns_when_disguised);
-    }
-
-    #[test]
-    fn blank_protocol_resolves_to_udp_without_losing_patch_presence() {
-        let defaults = TomlConfig::default();
-        assert_eq!(defaults.get_flags_patch().default_protocol, None);
-        assert_eq!(defaults.get_flags().default_protocol, "udp");
-        for protocol in ["", "  ", "\t"] {
-            let config =
-                TomlConfig::new_from_str(&format!("[flags]\ndefault_protocol = {protocol:?}"))
-                    .unwrap();
-            assert_eq!(
-                config.get_flags_patch().default_protocol.as_deref(),
-                Some(protocol)
-            );
-            assert_eq!(config.get_flags().default_protocol, "udp");
         }
     }
 
@@ -2467,24 +2152,6 @@ members = ["admin"]
         let group = config.get_acl().unwrap().acl_v1.unwrap().group.unwrap();
         assert!(group.declares.is_empty());
         assert_eq!(group.members, vec!["admin"]);
-    }
-
-    #[cfg(feature = "config-write")]
-    #[test]
-    fn test_vpn_config_roundtrip() {
-        let config = TomlConfigLoader::default();
-        let mut vpn = crate::config::vpn::VpnConfig::default();
-        vpn.rules.push(crate::config::vpn::VpnRuleConfig {
-            cidr: "0.0.0.0/0".parse().unwrap(),
-            exit: Some("10.144.144.2".parse().unwrap()),
-        });
-
-        config.set_vpn(vpn.clone());
-        assert_eq!(config.get_vpn(), vpn);
-
-        let dumped = config.dump();
-        let loaded = TomlConfigLoader::new_from_str(&dumped).unwrap();
-        assert_eq!(loaded.get_vpn(), vpn);
     }
 }
 

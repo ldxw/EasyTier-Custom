@@ -90,6 +90,25 @@ pub mod instance {
                 estimated_rx_bps: value.estimated_rx_bps,
                 estimated_tx_bps: value.estimated_tx_bps,
                 bandwidth_estimate_version: value.bandwidth_estimate_version,
+                current_rx_bps: value.current_rx_bps,
+                current_tx_bps: value.current_tx_bps,
+            }
+        }
+    }
+
+    impl From<crate::core_peer::peer::PeerConnFecStats> for PeerConnFecStats {
+        fn from(value: crate::core_peer::peer::PeerConnFecStats) -> Self {
+            Self {
+                active: value.active,
+                tx_sources: value.tx_sources,
+                tx_repairs: value.tx_repairs,
+                tx_source_bytes: value.tx_source_bytes,
+                tx_repair_bytes: value.tx_repair_bytes,
+                rx_sources: value.rx_sources,
+                rx_repairs: value.rx_repairs,
+                recovered: value.recovered,
+                duplicates: value.duplicates,
+                invalid_packets: value.invalid_packets,
             }
         }
     }
@@ -103,7 +122,9 @@ pub mod instance {
                 features: value.features,
                 tunnel: value.tunnel,
                 stats: value.stats.map(Into::into),
+                fec: value.fec.map(Into::into),
                 loss_rate: value.loss_rate,
+                link_loss_rate: value.link_loss_rate,
                 is_client: value.is_client,
                 network_name: value.network_name,
                 is_closed: value.is_closed,

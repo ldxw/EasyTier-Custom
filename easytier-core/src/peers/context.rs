@@ -32,6 +32,7 @@ use crate::{
     foundation::stats::{LabelSet, LabelType, MetricName, StatsManager},
     foundation::token_bucket::{ArcByteLimiter, BucketConfig, TokenBucketManager},
     peers::{
+        conn::fec::PeerConnFecMetrics,
         credential_manager::{CredentialManager, CredentialStorage},
         util::shrink_dashmap,
         whitelist::check_network_in_relay_whitelist,
@@ -144,11 +145,10 @@ impl PeerRuntimeSnapshot {
             need_p2p: flags.need_p2p,
             disable_p2p: flags.disable_p2p,
             avoid_relay_data: flags.disable_relay_data,
-            prefer_wss_http3_for_p2p: flags.p2p_disguise().prefers(),
-            disable_wss_http3_for_p2p: flags.p2p_disguise().forbids(),
-            only_use_wss_http3_for_p2p: flags.p2p_disguise().requires(),
             ..Default::default()
         };
+        let mut feature_flags = feature_flags;
+        feature_flags.set_p2p_disguise(flags.p2p_disguise());
         let peer_policy = PeerPolicyConfig {
             p2p_enabled: !flags.disable_p2p,
             relay_peer_rpc: flags.relay_all_peer_rpc,
@@ -286,18 +286,7 @@ pub(crate) struct CorePeerContext {
 }
 
 impl CorePeerContext {
-    #[cfg(test)]
-    pub(crate) fn new(config: CoreRuntimeConfigStore, adapters: CorePeerContextAdapters) -> Self {
-        Self::new_with_stats_manager(
-            config,
-            Arc::new(()),
-            adapters,
-            Arc::new(StatsManager::new()),
-        )
-    }
-
-    /// Builds a context that shares the instance's public-IPv6 state.
-    pub(crate) fn new_with_public_ipv6_state(
+    pub(crate) fn new(
         config: CoreRuntimeConfigStore,
         public_ipv6_state: Arc<dyn PeerPublicIpv6State>,
         adapters: CorePeerContextAdapters,
@@ -766,6 +755,10 @@ pub(crate) trait PeerContext: Send + Sync {
 
     fn record_control_rx(&self, _network_name: &str, _bytes: u64) {}
 
+    fn udp_fec_metrics(&self) -> Option<PeerConnFecMetrics> {
+        None
+    }
+
     fn recv_limiter(
         &self,
         _network_name: &str,
@@ -1072,6 +1065,13 @@ impl PeerContext for CorePeerContext {
         );
     }
 
+    fn udp_fec_metrics(&self) -> Option<PeerConnFecMetrics> {
+        Some(PeerConnFecMetrics::new(
+            &self.stats_manager,
+            self.network_name(),
+        ))
+    }
+
     fn recv_limiter(&self, network_name: &str, is_foreign_network: bool) -> Option<ArcByteLimiter> {
         let limits = self.snapshot().traffic_limits();
         let (key, bps) = if is_foreign_network && let Some(limit) = limits.foreign_relay_bps {
@@ -1341,6 +1341,7 @@ pub(crate) mod tests {
                 CoreRuntimeConfig::default(),
                 Arc::new(PeerRuntimeSnapshot::default()),
             ),
+            Arc::new(()),
             test_core_context_adapters(Arc::new(())),
         );
         let labels =
@@ -1427,8 +1428,11 @@ pub(crate) mod tests {
         snapshot.parallel_connections = 16;
         snapshot.max_direct_conns_per_peer_in_foreign_network = 3;
         let config = submitted_config(snapshot);
-        let context =
-            CorePeerContext::new(config.clone(), test_core_context_adapters(Arc::new(())));
+        let context = CorePeerContext::new(
+            config.clone(),
+            Arc::new(()),
+            test_core_context_adapters(Arc::new(())),
+        );
         let foreign = CorePeerContext::new_foreign(
             submitted_config(submitted_snapshot("foreign-identity", false)),
             test_core_context_adapters(Arc::new(())),
@@ -1462,8 +1466,11 @@ pub(crate) mod tests {
     #[test]
     fn core_peer_context_separates_config_versions_from_live_support() {
         let config = submitted_config(submitted_snapshot("before", false));
-        let context =
-            CorePeerContext::new(config.clone(), test_core_context_adapters(Arc::new(())));
+        let context = CorePeerContext::new(
+            config.clone(),
+            Arc::new(()),
+            test_core_context_adapters(Arc::new(())),
+        );
 
         assert_eq!(context.hostname(), "before");
         assert!(!context.feature_flags().avoid_relay_data);
@@ -1484,7 +1491,11 @@ pub(crate) mod tests {
     async fn core_peer_context_owns_events_and_projects_them_to_sink() {
         let config = submitted_config(submitted_snapshot("events", false));
         let sink = Arc::new(TestPeerEventSink::default());
-        let context = CorePeerContext::new(config, test_core_context_adapters(sink.clone()));
+        let context = CorePeerContext::new(
+            config,
+            Arc::new(()),
+            test_core_context_adapters(sink.clone()),
+        );
         let mut events = context.subscribe_peer_events().unwrap();
 
         context.issue_event(PeerEvent::PeerAdded(7));
@@ -1500,7 +1511,11 @@ pub(crate) mod tests {
     fn core_peer_context_owns_trusted_keys_and_projects_credential_changes() {
         let config = submitted_config(submitted_snapshot("trust", false));
         let events = Arc::new(TestPeerEventSink::default());
-        let context = CorePeerContext::new(config, test_core_context_adapters(events.clone()));
+        let context = CorePeerContext::new(
+            config,
+            Arc::new(()),
+            test_core_context_adapters(events.clone()),
+        );
         let public_key = vec![7; 32];
         let mut keys = TrustedKeyMap::new();
         keys.insert(
@@ -1524,7 +1539,11 @@ pub(crate) mod tests {
         let mut snapshot = submitted_snapshot("limiter", false);
         snapshot.runtime.core.traffic.foreign_relay_bps_limit = Some(1024);
         let config = submitted_config(snapshot);
-        let context = CorePeerContext::new(config, test_core_context_adapters(Arc::new(())));
+        let context = CorePeerContext::new(
+            config,
+            Arc::new(()),
+            test_core_context_adapters(Arc::new(())),
+        );
 
         let receive = context.recv_limiter("foreign", true).unwrap();
         let receive_again = context.recv_limiter("foreign", true).unwrap();
@@ -1540,7 +1559,11 @@ pub(crate) mod tests {
         snapshot.runtime.core.traffic.foreign_relay_bps_limit = None;
         snapshot.runtime.core.traffic.instance_recv_bps_limit = Some(1024);
         let config = submitted_config(snapshot);
-        let context = CorePeerContext::new(config, test_core_context_adapters(Arc::new(())));
+        let context = CorePeerContext::new(
+            config,
+            Arc::new(()),
+            test_core_context_adapters(Arc::new(())),
+        );
 
         assert!(context.recv_limiter("foreign", true).is_some());
         assert!(context.foreign_forward_limiter("foreign").is_none());
@@ -1769,6 +1792,7 @@ pub(crate) mod tests {
         let config = CoreRuntimeConfigStore::new(CoreRuntimeConfig::default(), Arc::new(snapshot));
         CorePeerContext::new(
             config,
+            Arc::new(()),
             CorePeerContextAdapters {
                 stun_info_source,
                 events: Arc::new(()),

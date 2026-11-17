@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use smoltcp::wire::{Ipv4Packet, Ipv6Packet};
+use smoltcp::wire::Ipv4Packet;
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinSet,
@@ -30,7 +30,6 @@ pub(super) struct SmoltcpPlane {
 impl SmoltcpPlane {
     pub(super) fn new(
         ipv4_addr: cidr::Ipv4Inet,
-        ipv6_addr: Option<cidr::Ipv6Inet>,
         peer_manager: Weak<PeerManagerCore>,
         packet_recv: Arc<Mutex<mpsc::Receiver<ZCPacket>>>,
     ) -> Self {
@@ -46,8 +45,17 @@ impl SmoltcpPlane {
             let mut packet_recv = packet_recv.lock().await;
             while let Some(packet) = packet_recv.recv().await {
                 tracing::trace!(?packet, "deliver peer packet to smoltcp");
+                let started = std::time::Instant::now();
                 if let Err(error) = stack_sink.send(Ok(packet.payload().to_vec())).await {
                     tracing::error!(?error, "deliver peer packet to smoltcp failed");
+                }
+                if crate::peers::conn::parallel::diag_enabled()
+                    && started.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    tracing::warn!(
+                        elapsed = ?started.elapsed(),
+                        "peer-to-smoltcp bridge blocked delivering a packet"
+                    );
                 }
             }
             tracing::debug!("peer-to-smoltcp bridge stopped");
@@ -55,25 +63,36 @@ impl SmoltcpPlane {
 
         forward_tasks.spawn(async move {
             while let Some(data) = stack_stream.recv().await {
-                let destination = match data.first().map(|v| v >> 4) {
-                    Some(4) => Ipv4Packet::new_checked(&data).map(|p| IpAddr::V4(p.dst_addr())),
-                    Some(6) => Ipv6Packet::new_checked(&data).map(|p| IpAddr::V6(p.dst_addr())),
-                    _ => {
-                        tracing::error!("smoltcp emitted an invalid IP packet");
-                        continue;
-                    }
-                };
-                let Ok(destination) = destination else {
+                let Ok(ipv4) = Ipv4Packet::new_checked(&data) else {
+                    tracing::error!(?data, "smoltcp emitted a non-IPv4 packet");
                     continue;
                 };
+                let destination = ipv4.dst_addr();
                 let Some(peer_manager) = peer_manager.upgrade() else {
                     tracing::debug!("smoltcp-to-peer bridge lost PeerManager");
                     return;
                 };
-                if let Err(error) = peer_manager
-                    .send_msg_by_ip(ZCPacket::new_with_payload(&data), destination, false)
-                    .await
-                {
+                let send = peer_manager.send_msg_by_ip(
+                    ZCPacket::new_with_payload(&data),
+                    IpAddr::V4(destination),
+                    false,
+                );
+                tokio::pin!(send);
+                let sent = if crate::peers::conn::parallel::diag_enabled() {
+                    tokio::select! {
+                        sent = &mut send => sent,
+                        _ = crate::foundation::time::sleep(std::time::Duration::from_secs(1)) => {
+                            tracing::warn!(
+                                ?destination,
+                                "smoltcp-to-peer bridge blocked sending a frame for over a second"
+                            );
+                            (&mut send).await
+                        }
+                    }
+                } else {
+                    (&mut send).await
+                };
+                if let Err(error) = sent {
                     tracing::error!(?error, "deliver smoltcp packet to peer failed");
                 }
             }
@@ -83,33 +102,40 @@ impl SmoltcpPlane {
         // A fixed seed replays IP IDs after the last consumer closes and the
         // stack is recreated, potentially reusing a remote shallow-cache route.
         let interface_config = Self::interface_config(rand::random());
-        let mut net_config = NetConfig::new(
-            interface_config,
-            format!("{}/{}", ipv4_addr.address(), ipv4_addr.network_length())
-                .parse()
-                .expect("validated IPv4 prefix"),
-            vec![
-                ipv4_addr
-                    .address()
-                    .to_string()
+        let net = Net::new(
+            device,
+            NetConfig::new(
+                interface_config,
+                format!("{}/{}", ipv4_addr.address(), ipv4_addr.network_length())
                     .parse()
-                    .expect("validated IPv4 address"),
-            ],
-            Some(BufferSize {
-                tcp_rx_size: 1024 * 128,
-                tcp_tx_size: 1024 * 128,
-                udp_rx_size: 1024 * 128,
-                udp_tx_size: 1024 * 128,
-                udp_rx_meta_size: 128,
-                udp_tx_meta_size: 128,
-            }),
+                    .expect("validated IPv4 prefix"),
+                vec![
+                    ipv4_addr
+                        .address()
+                        .to_string()
+                        .parse()
+                        .expect("validated IPv4 address"),
+                ],
+                Some(BufferSize {
+                    tcp_rx_size: 1024 * 128,
+                    tcp_tx_size: 1024 * 128,
+                    udp_rx_size: 1024 * 128,
+                    udp_tx_size: 1024 * 128,
+                    udp_rx_meta_size: 128,
+                    udp_tx_meta_size: 128,
+                }),
+            ),
         );
-        if let Some(v6) = ipv6_addr {
-            net_config = net_config
-                .with_additional_ip(v6.to_string().parse().expect("validated IPv6 prefix"));
-            net_config.gateway.push(v6.address().into());
+
+        if crate::peers::conn::parallel::diag_enabled() {
+            let net = net.diag_handle();
+            forward_tasks.spawn(async move {
+                loop {
+                    crate::foundation::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tracing::warn!(sockets = %net.diag_tcp_sockets(), "dataplane smoltcp diag");
+                }
+            });
         }
-        let net = Net::new(device, net_config);
 
         let forward_tasks = Arc::new(std::sync::Mutex::new(forward_tasks));
         forward_tasks.lock().unwrap().spawn(reap_joinset_background(

@@ -73,8 +73,8 @@ message Flags {
   // disable symmetric nat hole punching, treat symmetric as cone when enabled
   bool disable_sym_hole_punching = 30 [(easytier.flag) = { default: "false" }];
 
-   // tld dns zone for magic dns
-  string tld_dns_zone = 31 [(easytier.flag) = { default: "et.net.", form: true }];
+  // tld dns zone for magic dns
+  string tld_dns_zone = 31 [deprecated = true, (easytier.flag) = { default: "", deprecated: true }];
 
   bool p2p_only = 32 [(easytier.flag) = { default: "false" }];
 
@@ -97,9 +97,11 @@ message Flags {
   // Prefer direct credential peers that already relay to a destination over
   // advertising another direct edge to the same destination.
   bool prefer_peer_relay = 44 [(easytier.flag) = { default: "false" }];
+  bool enable_udp_fec = 45 [(easytier.flag) = { default: "false" }];
+  bool enable_udp_fec_kcp = 46 [(easytier.flag) = { default: "false" }];
+  bool enable_udp_fec_quic = 47 [(easytier.flag) = { default: "false" }];
 
-  // Legacy disguise booleans, replaced by p2p_disguise_mode. Configuration
-  // files that still use them are migrated when they are loaded.
+  // Former disguise booleans, replaced by p2p_disguise_mode.
   reserved 50045, 50046, 50047;
   reserved "only_use_wss_http3_for_hole_punching", "prefer_wss_http3_for_p2p", "disable_wss_http3_for_p2p";
 
@@ -117,6 +119,21 @@ message Flags {
 
   // Automatic P2P disguise policy: prefer, off, disabled, or only.
   string p2p_disguise_mode = 50050 [(easytier.flag) = { default: "prefer", form: true }];
+
+  // Redundancy of the FEC below HTTP3 tunnels, in repair datagrams per 100
+  // QUIC datagrams (1..=100). Zero follows the loss the peer measures. Takes
+  // effect where enable_http3_fec is set on either end of the tunnel.
+  uint32 http3_fec_ratio = 50051 [(easytier.flag) = { default: "0", form: true }];
+
+  // Reliable streams an HTTP3 tunnel spreads flows over (1..=32). Each flow
+  // stays on one stream, so a lost packet only holds back the flows on its
+  // stream. 1 keeps everything on one stream. A tunnel uses the smaller end's.
+  uint32 http3_streams = 50052 [(easytier.flag) = { default: "8", form: true }];
+
+  // FEC below HTTP3 tunnels, independent of enable_udp_fec. Either end asking
+  // protects both directions. In adaptive mode a clean path sends no repairs,
+  // so the cost is a trailer per datagram and a report every 50 ms.
+  bool enable_http3_fec = 50053 [(easytier.flag) = { default: "true", api: { field: "disable_http3_fec", negate: true } }];
 }
 
 
@@ -165,6 +182,7 @@ enum CompressionAlgoPb {
   Invalid = 0;
   None = 1;
   Zstd = 2;
+  Lzo = 3;
 }
 
 message RpcCompressionInfo {
@@ -314,3 +332,7 @@ message SecureModeConfig {
   // base64(X25519 public key), required if local_private_key is set
   optional string local_public_key = 3;
 }
+
+// Collection wrappers preserve omitted versus explicitly empty input.
+// The items field number and wire type are part of the configuration contract.
+message RepeatedString { repeated string items = 1; }

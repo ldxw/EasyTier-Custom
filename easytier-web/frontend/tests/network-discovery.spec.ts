@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { groupNetworks, retryDeviceWrite, type DeviceNetworkScan } from '../src/modules/networkDiscovery'
-import { ADVANCED_SWITCHES, advancedDistribution, touchedSettings } from '../src/modules/meshAdvanced'
+import { groupNetworks, networkClients, retryDeviceWrite, type DeviceNetworkScan, type NetworkMember } from '../src/modules/networkDiscovery'
+import { ADVANCED_CATEGORIES, ADVANCED_DEFAULTS, ADVANCED_PARAMETERS, ADVANCED_SWITCHES, UNSUPPORTED, advancedDistribution, isDefaultValue, sharedKey, touchedSettings } from '../src/modules/meshAdvanced'
 import { buildTopology, networkNameIdentity } from '../src/modules/networkTopology'
 
 const device = (id: string) => ({ machine_id: id, hostname: id, running_network_count: 0 }) as any
@@ -82,12 +82,50 @@ describe('network discovery', () => {
 describe('advanced settings', () => {
   it('counts how members hold each setting', () => {
     const distribution = advancedDistribution([
-      { latency_first: true, mtu: 1300 },
-      { latency_first: null, mtu: 1300 },
-      {},
+      { values: { latency_first: true, mtu: 1300 } },
+      { values: { latency_first: null, mtu: 1300 } },
+      { values: {} },
     ])
     expect(Object.fromEntries(distribution.latency_first)).toEqual({ true: 1, default: 2 })
     expect(Object.fromEntries(distribution.mtu)).toEqual({ 1300: 2, default: 1 })
+  })
+
+  it('counts a value equal to the core default as the default', () => {
+    const distribution = advancedDistribution([
+      { values: { latency_first: false, multi_thread: true, mtu: 1380, data_compress_algo: 1, traffic_disguise: 'speedtest', parallel_connections: 1 } },
+      { values: { multi_thread: false, data_compress_algo: 2 } },
+    ])
+    expect(Object.fromEntries(distribution.latency_first)).toEqual({ default: 2 })
+    expect(Object.fromEntries(distribution.multi_thread)).toEqual({ default: 1, false: 1 })
+    expect(Object.fromEntries(distribution.mtu)).toEqual({ default: 2 })
+    expect(Object.fromEntries(distribution.data_compress_algo)).toEqual({ default: 1, 2: 1 })
+    expect(Object.fromEntries(distribution.traffic_disguise)).toEqual({ default: 2 })
+    expect(Object.fromEntries(distribution.parallel_connections)).toEqual({ default: 2 })
+  })
+
+  it('offers the P2P protocol and disguise policy, gated by the device', () => {
+    const distribution = advancedDistribution([
+      { values: { p2p_prefer_protocol: 'udp', p2p_disguise_mode: 'only' }, capabilities: ['config:p2p_prefer_protocol', 'config:p2p_disguise_mode'] },
+      { values: { p2p_prefer_protocol: 'tcp' } },
+      { values: {}, capabilities: [] },
+    ])
+    expect(Object.fromEntries(distribution.p2p_prefer_protocol)).toEqual({ default: 1, tcp: 1, [UNSUPPORTED]: 1 })
+    expect(Object.fromEntries(distribution.p2p_disguise_mode)).toEqual({ only: 1, default: 1, [UNSUPPORTED]: 1 })
+  })
+
+  it('counts online devices that cannot store a setting apart from the default', () => {
+    const distribution = advancedDistribution([
+      { values: {}, capabilities: [] },
+      { values: { parallel_connections: 4 }, capabilities: ['config:parallel-connections-v1'] },
+      // Offline: judged by what it held when last seen.
+      { values: { parallel_connections: 4 } },
+    ])
+    expect(Object.fromEntries(distribution.parallel_connections)).toEqual({ [UNSUPPORTED]: 1, 4: 2 })
+    expect(Object.fromEntries(distribution.latency_first)).toEqual({ default: 3 })
+    expect(sharedKey(distribution.parallel_connections)).toBe('4')
+    expect(sharedKey(distribution.latency_first)).toBe('default')
+    expect(sharedKey(new Map([['default', 1], ['true', 1]]))).toBeUndefined()
+    expect(sharedKey(new Map([[UNSUPPORTED, 2]]))).toBeUndefined()
   })
 
   it('sends only touched settings, a reset included', () => {
@@ -95,8 +133,22 @@ describe('advanced settings', () => {
       .toEqual({ latency_first: true, lazy_p2p: null })
   })
 
-  it('never offers device settings, private mode or encryption', () => {
-    for (const field of ['enable_exit_node', 'no_tun', 'use_smoltcp', 'bind_device', 'proxy_forward_by_system', 'enable_private_mode', 'disable_encryption']) {
+  it('knows the default of every setting it offers', () => {
+    for (const field of ADVANCED_SWITCHES) expect(typeof ADVANCED_DEFAULTS[field]).toBe('boolean')
+    // Official cores get private mode from the console, so on is everyone's default.
+    expect(isDefaultValue('enable_private_mode', true)).toBe(true)
+    expect(isDefaultValue('enable_private_mode', false)).toBe(false)
+    expect(ADVANCED_DEFAULTS.multi_thread).toBe(true)
+    expect(ADVANCED_DEFAULTS.disable_ipv6).toBe(false)
+  })
+
+  it('puts every setting in exactly one category', () => {
+    const categorized = ADVANCED_CATEGORIES.flatMap(category => category.fields)
+    expect([...categorized].sort()).toEqual([...ADVANCED_SWITCHES, ...ADVANCED_PARAMETERS.map(parameter => parameter.field)].sort())
+  })
+
+  it('never offers device settings or encryption', () => {
+    for (const field of ['enable_exit_node', 'no_tun', 'use_smoltcp', 'bind_device', 'proxy_forward_by_system', 'disable_encryption']) {
       expect(ADVANCED_SWITCHES).not.toContain(field)
     }
   })
@@ -127,5 +179,24 @@ describe('device writes over an unsteady link', () => {
     const refused = failing([{ response: { status: 403 } }])
     await expect(retryDeviceWrite(refused.write, [0, 0])).rejects.toEqual({ response: { status: 403 } })
     expect(refused.calls()).toBe(1)
+  })
+})
+
+describe('network clients', () => {
+  const member = (machine: string, instance: string) =>
+    ({ key: `${machine}/${instance}`, instanceId: instance, device: { machine_id: machine }, online: true, running: true } as unknown as NetworkMember)
+  const route = (peer_id: number, inst_id: string, extra: object = {}) =>
+    ({ peer_id, inst_id, hostname: `host-${peer_id}`, ipv4_addr: { address: { addr: 0x0a7e7e00 + peer_id }, network_length: 24 }, ...extra })
+
+  it('lists route-table peers that are neither members nor public servers, once', () => {
+    const members = [member('m1', 'i1'), member('m2', 'i2')]
+    const details = new Map<string, any>([
+      ['m1/i1', { my_node_info: { peer_id: 1 }, routes: [route(2, 'i2'), route(5, 'c5', { cost: 3 }), route(9, 'server', { feature_flag: { is_public_server: true } })] }],
+      ['m2/i2', { my_node_info: { peer_id: 2 }, routes: [route(1, 'i1'), route(5, 'c5'), route(6, '')] }],
+    ])
+    expect(networkClients(details, members)).toEqual([
+      { key: 'c5', peerId: 5, hostname: 'host-5', address: '10.126.126.5/24' },
+      { key: 'peer:6', peerId: 6, hostname: 'host-6', address: '10.126.126.6/24' },
+    ])
   })
 })

@@ -3367,6 +3367,28 @@ pub async fn port_forward_with_inbound_default_drop_acl_test(
         .await;
     }
 
+    // The port forward resolves its destination through the outbound packet
+    // router, which can lag behind the peer route snapshots that
+    // `init_three_node_ex` waits for. Gate on the router itself so the first
+    // forwarded connection is not reset by a transient lookup miss.
+    for dst in ["10.144.144.3", "10.1.2.4"] {
+        let dst: std::net::Ipv4Addr = dst.parse().unwrap();
+        wait_for_condition_named(
+            || async {
+                !insts[0]
+                    .get_core_instance()
+                    .peer_manager()
+                    .get_msg_dst_peer_ipv4(&dst)
+                    .await
+                    .0
+                    .is_empty()
+            },
+            Duration::from_secs(10),
+            "port forward destination route",
+        )
+        .await;
+    }
+
     for (bind_port, server_ns) in [
         (23456, network.namespace("net_c")),
         (23457, network.namespace("net_d")),
@@ -5111,34 +5133,6 @@ pub async fn config_patch_test() {
             .ipv6_public_addr_prefix,
         Some(public_prefix.parse().unwrap())
     );
-
-    // 测试1.1：热更新网段出口 VPN 配置
-    let patch = InstanceConfigPatch {
-        vpn: Some(easytier_proto::api::manage::VpnConfig {
-            rules: vec![easytier_proto::api::manage::VpnRuleConfig {
-                cidr: "0.0.0.0/0".to_owned(),
-                exit_addr: "10.144.144.3".to_owned(),
-            }],
-        }),
-        ..Default::default()
-    };
-    insts[1]
-        .get_config_patcher()
-        .apply_patch(patch)
-        .await
-        .unwrap();
-    let vpn = insts[1].get_global_ctx().config.get_vpn();
-    assert!(vpn.client_active());
-    assert!(vpn.rules[0].cidr.is_default_route());
-    assert_eq!(vpn.exit_addresses().len(), 1);
-    assert_eq!(
-        vpn.rules[0].exit,
-        Some("10.144.144.3".parse::<std::net::IpAddr>().unwrap())
-    );
-    let status = insts[1].get_core_instance().vpn_status().await;
-    assert!(status.enabled);
-    assert_eq!(status.rules.len(), 1);
-    assert_eq!(status.rules[0].cidr, "0.0.0.0/0");
 
     // 测试2: 端口转发
     let patch = InstanceConfigPatch {

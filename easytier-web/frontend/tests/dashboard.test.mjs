@@ -444,10 +444,14 @@ test('dashboard globe cards zoom without scrolling and load only complete rows',
     assert.equal((await nodeKind.innerText()).trim(), 'Managed', 'selected node detail shows its kind');
     assert.ok(await nodeKind.locator('i').evaluate(element => getComputedStyle(element).backgroundColor !== 'rgba(0, 0, 0, 0)'),
         'selected node kind keeps its colored marker');
-    await page.evaluate(() => {
+    // Put the globe in view with room to scroll both ways, whatever the
+    // exact height of the page.
+    const scrollToGlobe = () => page.evaluate(() => {
         const stage = document.querySelector('.globe-stage').getBoundingClientRect();
-        window.scrollTo(0, stage.top + window.scrollY - 400);
+        const lowest = document.documentElement.scrollHeight - innerHeight;
+        window.scrollTo(0, Math.min(stage.top + window.scrollY - 400, lowest - 100));
     });
+    await scrollToGlobe();
     const settleWheel = () => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     const distance = () => canvas.evaluate(element => Number(element.dataset.globeDistance));
     const scrollY = () => page.evaluate(() => window.scrollY);
@@ -537,10 +541,7 @@ test('dashboard globe cards zoom without scrolling and load only complete rows',
     await page.setViewportSize({ width: 1440, height: 960 });
     await page.waitForFunction(previous => document.querySelectorAll('.globe-node-label').length > previous, mobileCount);
     await assertCompleteCards();
-    await page.evaluate(() => {
-        const stage = document.querySelector('.globe-stage').getBoundingClientRect();
-        window.scrollTo(0, stage.top + window.scrollY - 400);
-    });
+    await scrollToGlobe();
 
     state.machines[0].info.running_network_instances = [uuid(100)];
     state.machineNetworkInfo = { [id(100)]: state.machineNetworkInfo[id(100)] };
@@ -614,10 +615,10 @@ for (const [apiHost, hostname] of [
 
 test('device search, sort, expansion and routed drawer survive reload and history', async t => {
     const { page } = await open(t, '/h/deviceList');
-    await page.locator('.device-card').first().waitFor();
+    await page.locator('.device-cards .entity-card').first().waitFor();
     await page.locator('.view-toggle .pi-table').click();
     const table = page.locator('.desktop-list');
-    await table.getByRole('button', { name: 'Amsterdam gateway', exact: true }).waitFor();
+    await table.getByText('Amsterdam gateway', { exact: true }).waitFor();
     await page.getByRole('textbox', { name: 'Search name or address' }).fill('192.0.2.10');
     assert.equal(await table.locator('tbody > tr').count(), 1);
     await page.getByRole('textbox', { name: 'Search name or address' }).fill('');
@@ -629,7 +630,7 @@ test('device search, sort, expansion and routed drawer survive reload and histor
     await table.locator('.device-details').waitFor();
     await page.getByRole('textbox', { name: 'Search name or address' }).fill('192.0.2.');
     const tableElement = await table.elementHandle();
-    await table.getByRole('button', { name: 'Amsterdam gateway', exact: true }).click();
+    await table.locator('tbody > tr').filter({ hasText: 'Amsterdam gateway' }).getByRole('button', { name: 'Status', exact: true }).click();
     await page.locator('.console-device-drawer').waitFor();
     assert.ok(page.url().endsWith(`/deviceList?device=${id(1)}&instance=${id(100)}`));
     assert.ok(await tableElement.evaluate(element => element === document.querySelector('.desktop-list')), 'opening a device preserves the list');
@@ -654,9 +655,9 @@ test('switching the viewed network and device preserves the list and open drawer
         [id(101)]: { network_name: 'Home lab', config_permission: 7 },
     } } }));
     const table = page.locator('.desktop-list');
-    await page.locator('.device-card').first().waitFor();
+    await page.locator('.device-cards .entity-card').first().waitFor();
     await page.locator('.view-toggle .pi-table').click();
-    await table.getByRole('button', { name: 'Amsterdam gateway', exact: true }).click();
+    await table.locator('tbody > tr').filter({ hasText: 'Amsterdam gateway' }).getByRole('button', { name: 'Status', exact: true }).click();
     const drawer = page.locator('.console-device-drawer');
     await drawer.waitFor();
     const tableElement = await table.elementHandle();
@@ -678,17 +679,17 @@ test('switching the viewed network and device preserves the list and open drawer
 });
 
 test('device list defaults to cards and persists both view modes across reload', async t => {
-    const { page } = await open(t, '/h/deviceList');
-    const cards = page.locator('.device-card');
+    const { page, state } = await open(t, '/h/deviceList');
+    const cards = page.locator('.device-cards .entity-card');
     await cards.first().waitFor();
     assert.equal(await cards.count(), 6);
     assert.equal(await page.locator('.desktop-list').count(), 0, 'device list defaults to cards');
     await page.locator('.view-toggle .pi-table').click();
     const table = page.locator('.desktop-list');
-    await table.getByRole('button', { name: 'Amsterdam gateway', exact: true }).waitFor();
+    await table.getByText('Amsterdam gateway', { exact: true }).waitFor();
     assert.equal(await table.locator('tbody > tr').count(), 6);
     await page.reload();
-    await table.getByRole('button', { name: 'Amsterdam gateway', exact: true }).waitFor();
+    await table.getByText('Amsterdam gateway', { exact: true }).waitFor();
     assert.equal(await cards.count(), 0, 'table selection survives a reload');
     await page.locator('.view-toggle .pi-th-large').click();
     await cards.first().waitFor();
@@ -697,6 +698,22 @@ test('device list defaults to cards and persists both view modes across reload',
     await cards.first().waitFor();
     assert.equal(await cards.count(), 6);
     assert.equal(await table.count(), 0, 'card selection survives a reload');
+
+    // Clicking a name renames the device; Escape leaves it alone.
+    // Cards keep their order while one is edited, so find it by position.
+    const card = cards.nth(1);
+    await card.getByText('Build server', { exact: true }).waitFor();
+    await card.getByRole('button', { name: 'Build server', exact: true }).click();
+    const input = card.getByRole('textbox', { name: 'Rename', exact: true });
+    await input.fill('Ignored');
+    await input.press('Escape');
+    await card.getByRole('button', { name: 'Build server', exact: true }).click();
+    await input.fill('  Build box  ');
+    await input.press('Enter');
+    await input.waitFor({ state: 'detached' });
+    assert.deepEqual(state.writes.filter(write => write.path.endsWith('/alias')),
+        [{ path: `/machines/${id(2)}/alias`, method: 'PUT', payload: { alias: 'Build box' } }]);
+    assert.deepEqual(await card.locator('.entity-card-foot button').allTextContents(), ['Status', 'Edit', 'Delete']);
 });
 
 test('network list defaults to cards and a new network needs only its name', async t => {
@@ -868,10 +885,13 @@ test('the virtual subnet moves static members and keeps their host parts', async
 test('network pages share one shell and the settings apply only changed core fields', async t => {
     const { page, state } = await open(t, '/h/networks/view/team-0');
     await page.getByRole('heading', { name: /Engineering/ }).waitFor();
+    // The open network lists its pages in the sidebar; the page has no menu of its own.
+    const sections = page.locator('.console-sidebar .nav-network.open .nav-sections');
     for (const section of ['Overview', 'Members', 'Network settings', 'Advanced settings', 'Preset for new devices', 'Temporary devices']) {
-        assert.equal(await page.locator('.network-sections').getByRole('link', { name: section }).count(), 1, `${section} is a sub-page`);
+        assert.equal(await sections.getByRole('link', { name: section }).count(), 1, `${section} is a sub-page`);
     }
-    await page.locator('.network-sections').getByRole('link', { name: 'Network settings' }).click();
+    assert.equal(await page.locator('.console-sidebar .nav-sections').count(), 1, 'only the open network lists its pages');
+    await sections.getByRole('link', { name: 'Network settings' }).click();
     await page.waitForURL('**/networks/view/team-0/settings');
     const apply = page.getByRole('button', { name: 'Save and apply', exact: true });
     await page.locator('#settings-network-secret').waitFor();
@@ -911,15 +931,20 @@ test('advanced settings send only touched settings and report locked members', a
     const row = field => page.locator('.advanced-row').filter({ hasText: field });
     await row('Latency-First').getByText('On 1', { exact: true }).waitFor();
     await page.getByText('1 locked, skipped', { exact: true }).waitFor();
+    // An untouched row shows what the members share; the default is offered as "Default".
+    assert.equal(await row('Latency-First').getByRole('button', { name: 'On', exact: true }).getAttribute('aria-pressed'), 'true');
+    assert.equal(await row('Magic DNS').getByRole('button', { name: 'Default (Off)', exact: true }).getAttribute('aria-pressed'), 'true');
     const apply = page.getByRole('button', { name: /^Apply \d+ setting/ });
     assert.ok(await apply.isDisabled());
-    await row('Latency-First').getByText('Off', { exact: true }).click();
-    await page.locator('#advanced-touch-mtu').check();
+    await row('Latency-First').getByRole('button', { name: 'Default (Off)', exact: true }).click();
     await page.locator('#advanced-mtu').fill('1300');
     await page.locator('#advanced-mtu').press('Tab');
+    const parallel = page.locator('.advanced-row').filter({ has: page.getByText('Parallel connections', { exact: true }) });
+    await parallel.getByRole('button', { name: 'Default', exact: true }).click();
+    await parallel.getByRole('button', { name: 'Undo change', exact: true }).click();
     await page.getByRole('button', { name: 'Apply 2 setting(s) to 1 member(s)', exact: true }).click();
     await page.getByText('Locked; skipped', { exact: true }).waitFor();
-    assert.deepEqual(state.writes.find(write => write.path === '/mesh/advanced').payload, { network_name: 'team-0', change: { latency_first: false, mtu: 1300 } });
+    assert.deepEqual(state.writes.find(write => write.path === '/mesh/advanced').payload, { network_name: 'team-0', change: { latency_first: null, mtu: 1300 } });
 });
 
 test('presets reach only joining devices and new devices may join on their own', async t => {
@@ -937,7 +962,31 @@ test('presets reach only joining devices and new devices may join on their own',
     assert.deepEqual(state.writes.find(write => write.path === '/mesh/networks/team-0/auto-join').payload, { enabled: true });
 });
 
-test('members default to cards, skip locked ones and open devices over the page', async t => {
+test('access control loads the policy the members hold and offers clients as sources', async t => {
+    const { page } = await open(t, '/h', {}, state => {
+        state.machines[0].online = true;
+        state.networks[0].network_name = 'Engineering';
+        state.meshMembers = [{ device_id: id(1), instance_id: id(100), network_name: 'Engineering', online: true, pending: false, credential: false, locked: false }];
+    });
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.route('**/api/v1/topology/networks', route => route.fulfill({ json: { machines: { [id(1)]: { info: { info: { map: {
+        [id(100)]: { running: true, my_node_info: { peer_id: 1 }, routes: [
+            { peer_id: 32, inst_id: 'relayed', hostname: 'Relayed phone', ipv4_addr: { address: { addr: 0x0a7e7e33 }, network_length: 24 }, cost: 2, next_hop_peer_id: 31 },
+        ] },
+    } } } } } } }));
+    await page.route('**/mesh/networks/Engineering/acl', route => route.fulfill({ json: { members: [], temporary: [], acl: {
+        default_action: 'deny', groups: [{ name: 'admins', members: [id(100)] }],
+        rules: [{ id: 'r1', name: 'Admins reach all', enabled: true, action: 'allow', sources: [{ type: 'address', cidr: '10.126.126.51/32' }],
+            destinations: [{ type: 'all' }], protocols: [{ protocol: 'any', ports: [], stateful: false }] }],
+    } } }));
+    await page.goto(`${base}/#/h/networks/view/Engineering/acl`);
+    await page.locator('.acl-row').first().waitFor();
+    await page.getByText('Relayed phone · Client · 10.126.126.51', { exact: true }).waitFor();
+    assert.deepEqual(errors, [], 'the reactive policy is copied without errors');
+});
+
+test('members default to cards, mark locked ones and open devices over the page', async t => {
     const { page, state } = await open(t, '/h/networks/view/team-0/members', {}, state => {
         state.machines[0].online = true;
         state.meshMembers = [{ device_id: id(1), instance_id: id(100), network_name: 'Engineering', online: true, pending: false, credential: false, locked: true }];
@@ -951,17 +1000,18 @@ test('members default to cards, skip locked ones and open devices over the page'
         [id(100)]: { network_name: 'Engineering', config_permission: 0 },
     } } }));
     await page.goto(`${base}/#/h/networks/view/Engineering/members`);
-    const card = page.locator('.member-card').filter({ hasText: 'Amsterdam gateway' });
-    await card.getByText('Locked', { exact: true }).waitFor();
+    const card = page.locator('.member-cards .entity-card').filter({ hasText: 'Amsterdam gateway' });
     await card.getByText('10.126.126.5/24', { exact: true }).waitFor();
     assert.equal(await card.getByText(id(100).slice(0, 8)).count(), 0, 'instance ids are not shown');
     assert.equal(await card.getByText('192.0.2.', { exact: false }).count(), 0, 'public addresses are not shown');
-    assert.ok(await card.getByRole('checkbox').isDisabled(), 'locked members are not part of a batch');
+    assert.ok(await card.getByRole('checkbox').isEnabled(), 'a locked member can still be picked');
+    await card.locator('.entity-card-foot').getByRole('img', { name: 'Locked', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Add devices', exact: true }).first().click();
     const dialog = page.getByRole('dialog');
     await dialog.getByText('No online device can be added', { exact: true }).waitFor();
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await card.getByRole('button', { name: 'Amsterdam gateway' }).click();
+    assert.equal(await card.getByRole('button', { name: 'Amsterdam gateway' }).count(), 0, 'the name only names the member');
+    await card.getByRole('button', { name: 'Status', exact: true }).click();
     await page.waitForURL(`**/networks/view/Engineering/members?device=${id(1)}&instance=${id(100)}`);
     await page.locator('.console-device-drawer h2').filter({ hasText: 'Amsterdam gateway' }).waitFor();
     await page.locator('.console-device-drawer').getByText('Network Status', { exact: true }).waitFor();
@@ -1158,6 +1208,44 @@ test('credentials tab and temporary devices render', async t => {
     await page.getByRole('cell', { name: /Visitor phone/ }).waitFor();
 });
 
+test('temporary devices can be added for good or for a custom time', async t => {
+    const { page, state } = await open(t, '/h/networks/view/team-0/temporary', {}, state => {
+        state.storage['networkMembers.viewMode'] = 'table';
+        state.networks[0].secure_mode = true;
+        state.credentials = [{
+            credential_id: 'cred-forever', credential_secret: 'test-credential-secret',
+            expiry_unix: 253402300799, reusable: true, online_peers: [],
+        }];
+    });
+    const dialog = page.getByRole('dialog');
+    // Each round adds another device, since added ones are no longer offered.
+    const devices = ['Build server', 'Office workstation', 'Storage node'];
+    const addWith = async choose => {
+        await page.getByRole('button', { name: 'Add Devices' }).click();
+        await dialog.getByRole('row').filter({ hasText: devices.shift() }).getByRole('checkbox').check();
+        await choose();
+        await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+        await dialog.waitFor({ state: 'detached' });
+        return state.writes.filter(w => w.method === 'POST' && w.path.endsWith('/members')).at(-1).payload.ttl_seconds;
+    };
+    assert.equal(await addWith(() => dialog.getByRole('button', { name: 'Permanent', exact: true }).click()), 0);
+    assert.equal(await addWith(async () => {
+        await dialog.getByRole('button', { name: 'Custom', exact: true }).click();
+        await dialog.getByRole('spinbutton', { name: 'Custom' }).fill('12');
+        await dialog.getByRole('spinbutton', { name: 'Custom' }).blur();
+    }), 12 * 24 * 3600, 'custom amounts start in days');
+    assert.equal(await addWith(async () => {
+        await dialog.getByRole('button', { name: 'Custom', exact: true }).click();
+        await dialog.getByRole('combobox', { name: 'Unit' }).click();
+        await page.getByRole('option', { name: 'hours' }).click();
+        await dialog.getByRole('spinbutton', { name: 'Custom' }).fill('5');
+        await dialog.getByRole('spinbutton', { name: 'Custom' }).blur();
+    }), 5 * 3600);
+
+    await page.getByRole('tab', { name: 'Credentials', exact: true }).click();
+    await page.getByRole('row').filter({ hasText: 'cred-forever' }).getByText('Permanent').waitFor();
+});
+
 test('PublicServer credential exports use the configured public server', async t => {
     const peer = 'tcp://public.example.test:11010';
     const { page } = await open(t, '/h/networks/view/team-0/temporary', {}, state => {
@@ -1297,19 +1385,15 @@ test('empty and failed lists recover without presenting an empty result as succe
 
 test('responsive layouts, localization, dark mode and mobile drawer', async t => {
     const { page, state } = await open(t);
-    const workspaceMenu = page.locator('.console-sidebar').getByRole('menu', { name: 'Navigation' });
-    await workspaceMenu.focus();
-    await page.keyboard.press('ArrowDown'); // Dashboard -> Device List
+    const sidebar = page.locator('.console-sidebar').getByRole('navigation', { name: 'Navigation' });
+    await sidebar.getByRole('link', { name: 'Device List', exact: true }).focus();
     await page.keyboard.press('Enter');
     await page.waitForURL('**/#/h/deviceList');
-    await workspaceMenu.locator('[aria-current="page"]', { hasText: 'Device List' }).waitFor();
-    assert.equal(await workspaceMenu.locator('[aria-current="page"]').textContent(), 'Device List');
-    const networkMenu = page.locator('.console-sidebar').getByRole('menu', { name: 'Networks' });
-    await networkMenu.focus();
-    await page.keyboard.press('ArrowDown'); // Networks overview -> Engineering (first nav-child)
-    await page.keyboard.press('Enter');
+    assert.equal(await sidebar.locator('[aria-current="page"]').textContent(), 'Device List');
+    await sidebar.getByRole('link', { name: /^Engineering/ }).click();
     await page.waitForURL('**/networks/view/team-0');
-    await networkMenu.locator('[aria-current="page"]', { hasText: 'Engineering' }).waitFor();
+    await sidebar.locator('.nav-network.open .nav-sections [aria-current="page"]', { hasText: 'Overview' }).waitFor();
+    assert.deepEqual(await page.locator('.console-breadcrumb > span').allTextContents(), ['Networks', 'Engineering', 'Overview']);
     for (const colorScheme of ['light', 'dark']) {
         await page.emulateMedia({ colorScheme });
         for (const width of [1440, 1024, 390]) {
@@ -1338,14 +1422,14 @@ test('responsive layouts, localization, dark mode and mobile drawer', async t =>
     state.machines[0].info.hostname = 'A-very-long-device-hostname-that-must-wrap-without-breaking-the-layout.example.internal';
     await page.setViewportSize({ width: 390, height: 960 });
     await page.goto(`${base}/#/h/deviceList`);
-    await page.locator('.mobile-list .entity-link').first().click();
+    await page.locator('.mobile-list .mobile-actions button').first().click();
     await page.locator('.console-device-drawer').waitFor();
     await page.waitForFunction(() => Math.abs(document.querySelector('.console-device-drawer').getBoundingClientRect().left) < 1);
     assert.ok(await page.locator('.console-device-drawer').evaluate(el => el.getBoundingClientRect().width <= innerWidth));
     if (screenshotDir) await page.screenshot({ path: `${screenshotDir}/device-drawer-mobile.png`, animations: 'disabled' });
     await page.keyboard.press('Escape');
     await page.locator('.mobile-nav-toggle').click();
-    await page.locator('.console-mobile-nav').getByRole('menu', { name: '导航' }).waitFor();
+    await page.locator('.console-mobile-nav').getByRole('navigation', { name: '导航' }).waitFor();
     await page.locator('.console-mobile-nav').getByRole('link', { name: '设备列表', exact: true }).click();
     await page.locator('.console-mobile-nav').waitFor({ state: 'detached' });
     await page.locator('.mobile-nav-toggle').click();

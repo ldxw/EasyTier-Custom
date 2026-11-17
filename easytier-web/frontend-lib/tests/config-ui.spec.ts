@@ -420,10 +420,7 @@ function makeConfig(): NetworkConfig {
     routes: ['192.168.0.0/16'],
     enable_socks5: true,
     socks5_port: 1086,
-    exit_nodes: ['10.144.144.3'],
-    vpn: {
-      rules: [{ cidr: '0.0.0.0/0', exit_addr: '10.144.144.2' }],
-    },
+    exit_nodes: ['exit-a'],
     mapped_listeners: ['tcp://127.0.0.1:22000'],
     port_forwards: [{
       proto: 'udp',
@@ -502,21 +499,6 @@ describe('Config.vue network config projection', () => {
     wrapper.unmount()
   })
 
-  it('offers exit forwarding only through the official switch, off by default', async () => {
-    const config = DEFAULT_NETWORK_CONFIG()
-    config.advanced_settings = true
-    const { curNetwork, wrapper } = mountConfig(config, ['config:vpn-subnet-exit-v1'])
-    await nextTick()
-    expect(input(wrapper, '#enable_exit_node').checked).toBe(false)
-    expect(wrapper.find('#vpn_exit_enabled').exists()).toBe(false)
-    await wrapper.find('#enable_exit_node').setValue(true)
-    expect(curNetwork.enable_exit_node).toBe(true)
-    // Offering an exit never writes a VPN section the user did not edit.
-    expect(curNetwork.vpn).toBeUndefined()
-    expect(toBackendNetworkConfig(curNetwork).enable_exit_node).toBe(true)
-    wrapper.unmount()
-  })
-
   it('uses a compact policy dropdown and one field on current custom kernels', async () => {
     const { curNetwork, wrapper } = mountConfig(makeConfig(), ['config:p2p_disguise_mode'])
     await nextTick()
@@ -550,12 +532,13 @@ describe('Config.vue network config projection', () => {
     const { curNetwork, wrapper } = mountConfig(config, [])
     await nextTick()
 
-    for (const field of ['close_redundant_conns_when_disguised', 'p2p_prefer_protocol', 'p2p_disguise_mode', 'sni']) {
+    for (const field of ['close_redundant_conns_when_disguised', 'disable_http3_fec', 'p2p_prefer_protocol', 'p2p_disguise_mode', 'sni']) {
       expect(wrapper.find(`#${field}`).exists(), `${field} should be absent for official runtimes`).toBe(false)
       expect(wrapper.find(`label[for="${field}"]`).exists()).toBe(false)
       expect(wrapper.find(`[data-tooltip="${field}_help"]`).exists()).toBe(false)
     }
-    for (const field of CONFIG_FLAG_FIELDS.filter(field => field !== 'close_redundant_conns_when_disguised')) {
+    const customFlags: readonly string[] = ['close_redundant_conns_when_disguised', 'disable_http3_fec']
+    for (const field of CONFIG_FLAG_FIELDS.filter(field => !customFlags.includes(field))) {
       expect(input(wrapper, `#${field}`).disabled, `${field} should remain editable`).toBe(false)
     }
     for (const urls of wrapper.findAllComponents(UrlListInputStub)) {
@@ -714,7 +697,6 @@ describe('Config.vue network config projection', () => {
     expect(input(wrapper, '#hostname').value).toBe('host-a')
     expect(input(wrapper, '#sni').value).toBe('www.cloudflare.com')
     expect(wrapper.find<HTMLSelectElement>('select#p2p_disguise_mode').element.value).toBe('only')
-    expect(input(wrapper, '#tld_dns_zone').value).toBe('et.net.')
     expect(input(wrapper, '#subnet-proxy').value).toBe('10.10.0.0/16,172.16.1.0/24')
     expect(input(wrapper, '#vpn_portal_wireguard_listen').value).toBe('0.0.0.0:22023')
     expect(input(wrapper, '#dev_name').value).toBe('tun-test')
@@ -723,10 +705,7 @@ describe('Config.vue network config projection', () => {
     expect(input(wrapper, '#relay_network_whitelist').value).toBe('network-a')
     expect(input(wrapper, '#routes').value).toBe('192.168.0.0/16')
     expect(input(wrapper, '#socks5_port').value).toBe('1086')
-    expect(input(wrapper, '#enable_exit_node').checked).toBe(false)
-    expect(input(wrapper, '#exit_nodes').value).toBe('10.144.144.3')
-    expect(wrapper.find('#vpn_enabled').exists()).toBe(false)
-    expect(wrapper.find('#vpn_fail_mode').exists()).toBe(false)
+    expect(input(wrapper, '#exit_nodes').value).toBe('exit-a')
     expect(input(wrapper, 'input[data-add-label="add_listener_url"]').value).toBe('tcp://0.0.0.0:12010')
     expect(input(wrapper, 'input[data-add-label="add_mapped_listener"]').value).toBe('tcp://127.0.0.1:22000')
 
@@ -766,58 +745,6 @@ describe('Config.vue network config projection', () => {
     expect((editorSave.element as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('edits a single exit per subnet and keeps values after deleting another rule', async () => {
-    const { curNetwork, wrapper } = mountConfig()
-    await wrapper.find('button[data-label="vpn_add_rule"]').trigger('click')
-    await setInput(wrapper, '#vpn_rule_cidr_1', '2001:db8::/32')
-    await setInput(wrapper, '#vpn_rule_exit_1', 'fd42::2')
-    expect(curNetwork.vpn?.rules[1]).toEqual({ cidr: '2001:db8::/32', exit_addr: 'fd42::2' })
-    await wrapper.findAll('button[aria-label="vpn_rule_remove"]')[0].trigger('click')
-    expect(input(wrapper, '#vpn_rule_cidr_0').value).toBe('2001:db8::/32')
-    expect(input(wrapper, '#vpn_rule_exit_0').value).toBe('fd42::2')
-    expect(toBackendNetworkConfig(curNetwork).vpn?.rules).toEqual([{ cidr: '2001:db8::/32', exit_addr: 'fd42::2' }])
-    await wrapper.find('button[aria-label="vpn_rule_remove"]').trigger('click')
-    expect(curNetwork.vpn?.rules).toEqual([])
-    expect(wrapper.find('#enable_exit_node').exists()).toBe(true)
-  })
-
-  it('keeps a rule without an exit so it follows the exit nodes list', async () => {
-    const { curNetwork, wrapper } = mountConfig()
-    await wrapper.find('button[data-label="vpn_add_rule"]').trigger('click')
-    await setInput(wrapper, '#vpn_rule_cidr_1', '198.51.100.0/24')
-    expect(input(wrapper, '#vpn_rule_exit_1').getAttribute('placeholder')).toBe('vpn_rule_exit_placeholder')
-    // The empty exit is omitted from protobuf JSON; Core reads it as no exit.
-    expect(toBackendNetworkConfig(curNetwork).vpn?.rules[1]).toEqual({ cidr: '198.51.100.0/24' })
-  })
-
-  it('writes a VPN section only when the first rule is added', async () => {
-    const config = DEFAULT_NETWORK_CONFIG()
-    config.advanced_settings = true
-    const { curNetwork, wrapper } = mountConfig(config)
-    await nextTick()
-    expect(curNetwork.vpn).toBeUndefined()
-    await wrapper.find('button[data-label="vpn_add_rule"]').trigger('click')
-    expect(curNetwork.vpn).toEqual({ rules: [{ cidr: '', exit_addr: '' }] })
-    expect(wrapper.findAll('[data-testid="vpn-rule-card"]')).toHaveLength(1)
-  })
-
-  it('round-trips single-exit configuration and rejects removed JSON fields', () => {
-    const config = makeConfig()
-    expect(normalizeNetworkConfig(config).vpn).toEqual(config.vpn)
-    expect(toBackendNetworkConfig(config).vpn).toMatchObject({ rules: [{ cidr: '0.0.0.0/0', exit_addr: '10.144.144.2' }] })
-    for (const field of ['dns_protect', 'ipv6_protect', 'ignore_private', 'enabled', 'fail_mode', 'exits']) {
-      const legacy = makeConfig()
-      ;(legacy.vpn as any)[field] = false
-      expect(() => normalizeNetworkConfig(legacy)).toThrow()
-      expect(() => toBackendNetworkConfig(legacy)).toThrow()
-    }
-    for (const field of ['action', 'priority', 'exits', 'fallback_exits']) {
-      const legacy = makeConfig()
-      ;(legacy.vpn!.rules[0] as any)[field] = 'old'
-      expect(() => toBackendNetworkConfig(legacy)).toThrow()
-    }
-  })
-
   it('projects form edits back into config and backend JSON', async () => {
     const { curNetwork, wrapper } = mountConfig()
     await nextTick()
@@ -832,7 +759,6 @@ describe('Config.vue network config projection', () => {
     await setInput(wrapper, '#hostname', 'host-edited')
     await setInput(wrapper, '#sni', 'cdn.example.com')
     await wrapper.find('select#p2p_disguise_mode').setValue('prefer')
-    await setInput(wrapper, '#tld_dns_zone', 'nas.internal.')
     await setInput(wrapper, '#subnet-proxy', '10.7.0.0/16,172.17.0.0/16')
     await setInput(wrapper, '#vpn_portal_wireguard_listen', '[::]:23000')
     await setInput(wrapper, 'input[data-add-label="add_listener_url"]', 'tcp://0.0.0.0:13010')
@@ -842,7 +768,7 @@ describe('Config.vue network config projection', () => {
     await setInput(wrapper, '#relay_network_whitelist', 'network-edited')
     await setInput(wrapper, '#routes', '192.168.10.0/24')
     await setInput(wrapper, '#socks5_port', '1089')
-    await wrapper.find('#enable_exit_node').setValue(true)
+    await setInput(wrapper, '#exit_nodes', 'exit-edited')
     await setInput(wrapper, 'input[data-add-label="add_mapped_listener"]', 'tcp://127.0.0.1:23000')
     await wrapper.find('select#port_forward_proto').setValue('tcp')
     await setInput(wrapper, 'input[placeholder="port_forwards_bind_addr"]', '127.0.0.1')
@@ -863,7 +789,6 @@ describe('Config.vue network config projection', () => {
       hostname: 'host-edited',
       sni: 'cdn.example.com',
       p2p_disguise_mode: 'prefer',
-      tld_dns_zone: 'nas.internal.',
       proxy_cidrs: ['10.7.0.0/16', '172.17.0.0/16'],
       vpn_portal_config: {
         wireguard_listen: '[::]:23000',
@@ -881,11 +806,7 @@ describe('Config.vue network config projection', () => {
       relay_network_whitelist: ['network-edited'],
       routes: ['192.168.10.0/24'],
       socks5_port: 1089,
-      enable_exit_node: true,
-      exit_nodes: ['10.144.144.3'],
-      vpn: {
-        rules: [{ cidr: '0.0.0.0/0', exit_addr: '10.144.144.2' }],
-      },
+      exit_nodes: ['exit-edited'],
       mapped_listeners: ['tcp://127.0.0.1:23000'],
       port_forwards: [{
         proto: 'tcp',
@@ -904,14 +825,8 @@ describe('Config.vue network config projection', () => {
       sni: 'cdn.example.com',
       peer_urls: ['tcp://peer-x:11010', 'udp://peer-y:11010'],
       listener_urls: ['tcp://0.0.0.0:13010'],
-      tld_dns_zone: 'nas.internal.',
       mtu: 1260,
       instance_recv_bps_limit: '9007199254740993',
-      enable_exit_node: true,
-      exit_nodes: ['10.144.144.3'],
-      vpn: {
-        rules: [{ cidr: '0.0.0.0/0', exit_addr: '10.144.144.2' }],
-      },
       vpn_portal_config: {
         wireguard_listen: '[::]:23000',
         wireguard_private_key: 'portal-private-key',
@@ -929,9 +844,6 @@ describe('Config.vue network config projection', () => {
         dst_port: 9090,
       }],
     })
-
-    await setInput(wrapper, '#tld_dns_zone', '')
-    expect(toBackendNetworkConfig(curNetwork).tld_dns_zone).toBeUndefined()
   })
 
   it('shows a flag the configuration does not state as the value the core resolves without setting it', async () => {

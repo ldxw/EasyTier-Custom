@@ -6,6 +6,8 @@ import { Config, NetworkTypes, UrlListInput, Utils, StatusDisplay } from 'easyti
 import ApiClient, { type CentralNetworkDetail, type CentralNetworkMember, type NetworkCredential, type NodeAclRuleStat, type NodePeerInfo, type NodeRouteInfo, type TemporaryPeer } from '../../modules/api';
 import { normalizeVirtualSubnet } from '../../modules/virtual-subnet';
 import { toNetworkCidr } from '../../modules/cidr';
+import { DAY, isPermanentExpiry } from '../../modules/credentialTtl';
+import CredentialTtlPicker from './CredentialTtlPicker.vue';
 
 // Temporary devices of one network: devices whose whole configuration the
 // console publishes, authenticated by credentials instead of the secret.
@@ -119,18 +121,18 @@ const openAddMember = async () => {
     }
     selectedDevices.value = [];
     addTemporary.value = true;
-    addTtlHours.value = 7 * 24;
+    addTtl.value = 7 * DAY;
     addMemberVisible.value = true;
 };
 
 // Permanent members run the network from their own configuration.
 const addTemporary = ref(true);
-const addTtlHours = ref(7 * 24);
-const addTtlOptions = [
-    { label: t('web.network_detail.ttl_24h'), value: 24 },
-    { label: t('web.network_detail.ttl_7d'), value: 7 * 24 },
-    { label: t('web.network_detail.ttl_30d'), value: 30 * 24 },
-];
+const addTtl = ref(7 * DAY);
+// Credential expiries as a date, or permanent.
+const expiryDate = (expiryUnix: number) => isPermanentExpiry(expiryUnix)
+    ? t('web.network_detail.ttl_permanent') : new Date(expiryUnix * 1000).toLocaleDateString();
+const expiryTime = (expiryUnix: number) => isPermanentExpiry(expiryUnix)
+    ? t('web.network_detail.ttl_permanent') : new Date(expiryUnix * 1000).toLocaleString();
 
 const addMembers = async () => {
     const deviceIds = selectedDevices.value.map((device) => device.machine_id);
@@ -143,7 +145,7 @@ const addMembers = async () => {
             networkId.value,
             deviceIds,
             addTemporary.value,
-            addTemporary.value ? addTtlHours.value * 3600 : undefined,
+            addTemporary.value ? addTtl.value : undefined,
         );
         addMemberVisible.value = false;
         await loadAll();
@@ -628,10 +630,18 @@ const latencyLabel = (latencyMs: number | undefined) =>
     latencyMs == null ? '—' : `${Math.round(latencyMs)} ms`;
 const peerTelemetry = (peer: NodePeerInfo) => {
     const info = { peer } as unknown as NetworkTypes.PeerRoutePair;
-    return { bandwidth: StatusDisplay.estimatedBandwidth(info), traffic: StatusDisplay.totalTraffic(info) };
+    return {
+        bandwidth: StatusDisplay.estimatedBandwidth(info),
+        current: StatusDisplay.currentBandwidth(info),
+        traffic: StatusDisplay.totalTraffic(info),
+    };
 };
 const connectionBandwidth = (conn: NodePeerInfo['conns'][number]) =>
     StatusDisplay.estimatedConnectionBandwidth(conn as unknown as NetworkTypes.PeerConnInfo);
+const connectionCurrent = (conn: NodePeerInfo['conns'][number]) =>
+    StatusDisplay.currentConnectionBandwidth(conn as unknown as NetworkTypes.PeerConnInfo);
+const connectionLoss = (conn: NodePeerInfo['conns'][number]) =>
+    StatusDisplay.connectionLossRate(conn as unknown as NetworkTypes.PeerConnInfo) ?? '—';
 const connectionLatency = (conn: NodePeerInfo['conns'][number]) => {
     const microseconds = StatusDisplay.numericValue(conn.stats?.latency_us);
     return microseconds === undefined ? undefined : microseconds / 1000;
@@ -643,7 +653,7 @@ const connectionLatency = (conn: NodePeerInfo['conns'][number]) => {
 const nodePeerRows = computed(() => {
     const connsByPeer = new Map<number, NodePeerInfo>();
     (nodePeers.value ?? []).forEach(peer => connsByPeer.set(peer.peer_id, peer));
-    const rows = new Map<number, { key: string; peer_id: number; hostname: string; ipv4: string; cost: number; protocols: string[]; latencyMs?: number; bandwidth: { upload: string; download: string }; traffic: { upload: string; download: string } }>();
+    const rows = new Map<number, { key: string; peer_id: number; hostname: string; ipv4: string; cost: number; protocols: string[]; latencyMs?: number; bandwidth: { upload: string; download: string }; current: { upload: string; download: string }; traffic: { upload: string; download: string } }>();
     (nodeRoutes.value ?? []).forEach(route => {
         const addr = route.ipv4_addr;
         const ip = ipv4ToString(addr);
@@ -656,6 +666,7 @@ const nodePeerRows = computed(() => {
             protocols: [],
             latencyMs: route.path_latency,
             bandwidth: { upload: '--', download: '--' },
+            current: { upload: '--', download: '--' },
             traffic: { upload: '--', download: '--' },
         });
     });
@@ -676,6 +687,7 @@ const nodePeerRows = computed(() => {
             protocols: [],
             latencyMs: undefined,
             bandwidth: { upload: '--', download: '--' },
+            current: { upload: '--', download: '--' },
             traffic: { upload: '--', download: '--' },
         };
         Object.assign(row, peerTelemetry(peer));
@@ -732,20 +744,13 @@ const switchTabWithCredentials = async (tab: string) => {
     }
 };
 
-const ttlOptions = [
-    { label: t('web.network_detail.ttl_1h'), value: 1 },
-    { label: t('web.network_detail.ttl_24h'), value: 24 },
-    { label: t('web.network_detail.ttl_7d'), value: 168 },
-    { label: t('web.network_detail.ttl_30d'), value: 720 },
-];
-
 const generateVisible = ref(false);
 const generating = ref(false);
-const generateForm = ref({ ttl_hours: 24, reusable: true });
+const generateForm = ref({ ttl: DAY, reusable: true });
 const generatedCredential = ref<NetworkCredential | null>(null);
 
 const openGenerateCredential = () => {
-    generateForm.value = { ttl_hours: 24, reusable: true };
+    generateForm.value = { ttl: DAY, reusable: true };
     generatedCredential.value = null;
     generateVisible.value = true;
 };
@@ -755,7 +760,7 @@ const generateCredential = async () => {
     try {
         const created = await api?.generate_credential(
             networkId.value,
-            generateForm.value.ttl_hours * 3600,
+            generateForm.value.ttl,
             generateForm.value.reusable,
         );
         if (created) {
@@ -1007,7 +1012,7 @@ const switchTab = async (tab: string) => {
                                     <Tag v-if="member.temporary" :value="t('web.network_detail.temporary_tag')" severity="secondary" />
                                     <span v-if="member.temporary && member.credential_expiry_unix"
                                         class="text-xs muted">{{ t('web.network_detail.expires_at') }}
-                                        {{ new Date(member.credential_expiry_unix * 1000).toLocaleDateString() }}</span>
+                                        {{ expiryDate(member.credential_expiry_unix) }}</span>
                                     <Tag v-if="member.running === true" :value="t('web.network_detail.running')" severity="success" />
                                     <Tag v-else-if="member.running === false" :value="t('web.network_detail.stopped')" severity="warn" />
                                     <span v-if="member.runtime_virtual_ipv4" class="font-mono">{{ member.runtime_virtual_ipv4 }}</span>
@@ -1065,7 +1070,7 @@ const switchTab = async (tab: string) => {
                         </Column>
                         <Column :header="t('web.network_detail.credential_expiry')" style="width: 8rem">
                             <template #body="{ data }">
-                                <span v-if="data.credential_expiry_unix" class="muted">{{ new Date(data.credential_expiry_unix * 1000).toLocaleDateString() }}</span>
+                                <span v-if="data.credential_expiry_unix" class="muted">{{ expiryDate(data.credential_expiry_unix) }}</span>
                                 <span v-else class="muted">—</span>
                             </template>
                         </Column>
@@ -1095,7 +1100,7 @@ const switchTab = async (tab: string) => {
                                     </span>
                                     <span v-if="peer.credential_expiry_unix" class="text-xs muted">
                                         · {{ t('web.network_detail.expires_at') }}
-                                        {{ new Date(peer.credential_expiry_unix * 1000).toLocaleDateString() }}
+                                        {{ expiryDate(peer.credential_expiry_unix) }}
                                     </span>
                                     <Button :label="t('web.network_detail.locate_credential')" text size="small" severity="secondary"
                                         @click="locateCredential(peer.credential_id!)" />
@@ -1134,7 +1139,7 @@ const switchTab = async (tab: string) => {
                         </div>
                     </template></Column>
                     <Column :header="t('web.network_detail.credential_expiry')"><template #body="{ data }">
-                        {{ new Date(data.expiry_unix * 1000).toLocaleString() }}
+                        {{ expiryTime(data.expiry_unix) }}
                     </template></Column>
                     <Column :header="t('web.network_detail.credential_online_devices')"><template #body="{ data }">
                         <span v-if="!data.online_peers?.length" class="text-500">—</span>
@@ -1216,10 +1221,9 @@ const switchTab = async (tab: string) => {
             <div class="flex flex-col gap-2 mt-2">
                 <Message v-if="!network?.secure_mode" severity="warn" size="small" :closable="false">{{ t('web.network_detail.add_temporary_needs_secure') }}</Message>
                 <p v-else class="text-sm muted m-0">{{ t('web.network_detail.add_temporary_hint') }}</p>
-                <div class="flex items-center gap-2">
-                    <label for="add-ttl" class="text-sm">{{ t('web.network_detail.credential_ttl') }}</label>
-                    <SelectButton v-model="addTtlHours" :options="addTtlOptions"
-                        optionLabel="label" optionValue="value" size="small" />
+                <div class="flex items-start gap-2">
+                    <label class="text-sm shrink-0 pt-1.5">{{ t('web.network_detail.credential_ttl') }}</label>
+                    <CredentialTtlPicker v-model="addTtl" />
                 </div>
             </div>
             <template #footer>
@@ -1318,9 +1322,8 @@ const switchTab = async (tab: string) => {
             :header="t('web.network_detail.generate_credential')" :style="{ width: '34rem' }">
             <div v-if="!generatedCredential" class="flex flex-col gap-3">
                 <div class="flex flex-col gap-1">
-                    <label for="cred-ttl">{{ t('web.network_detail.credential_ttl') }}</label>
-                    <Select id="cred-ttl" v-model="generateForm.ttl_hours" :options="ttlOptions"
-                        optionLabel="label" optionValue="value" />
+                    <label>{{ t('web.network_detail.credential_ttl') }}</label>
+                    <CredentialTtlPicker v-model="generateForm.ttl" />
                 </div>
                 <div class="flex items-center gap-2">
                     <InputSwitch inputId="cred-reusable" v-model="generateForm.reusable" />
@@ -1448,10 +1451,10 @@ const switchTab = async (tab: string) => {
                                 <div class="whitespace-nowrap">{{ t('upload') }}: {{ data.traffic.upload }}</div>
                                 <div class="whitespace-nowrap">{{ t('download') }}: {{ data.traffic.download }}</div>
                             </template></Column>
-                            <Column :header="t('estimated_bandwidth')"><template #body="{ data }">
-                                <div v-tooltip="t('estimated_bandwidth_help')" class="whitespace-nowrap">
-                                    <div>{{ t('upload') }}: {{ data.bandwidth.upload }}</div>
-                                    <div>{{ t('download') }}: {{ data.bandwidth.download }}</div>
+                            <Column :header="t('bandwidth_reference_current')"><template #body="{ data }">
+                                <div v-tooltip="t('bandwidth_reference_current_help')" class="whitespace-nowrap">
+                                    <div>{{ t('upload') }}: {{ data.bandwidth.upload }} / {{ data.current.upload }}</div>
+                                    <div>{{ t('download') }}: {{ data.bandwidth.download }} / {{ data.current.download }}</div>
                                 </div>
                             </template></Column>
                             </DataTable>
@@ -1468,6 +1471,7 @@ const switchTab = async (tab: string) => {
                                     </div>
                                     <div class="mt-2">{{ t('total_traffic') }}: {{ t('upload') }} {{ peer.traffic.upload }} / {{ t('download') }} {{ peer.traffic.download }}</div>
                                     <div>{{ t('estimated_bandwidth') }}: {{ t('upload') }} {{ peer.bandwidth.upload }} / {{ t('download') }} {{ peer.bandwidth.download }}</div>
+                                    <div>{{ t('current_bandwidth') }}: {{ t('upload') }} {{ peer.current.upload }} / {{ t('download') }} {{ peer.current.download }}</div>
                                 </div>
                             </div>
                             </template>
@@ -1511,15 +1515,15 @@ const switchTab = async (tab: string) => {
                                 {{ latencyLabel(connectionLatency(data.conn)) }}
                             </template></Column>
                             <Column :header="t('web.network_detail.loss_rate')"><template #body="{ data }">
-                                {{ ((data.conn.loss_rate ?? 0) * 100).toFixed(1) + '%' }}
+                                <span v-tooltip="t('loss_rate_split_help')" class="whitespace-nowrap">{{ connectionLoss(data.conn) }}</span>
                             </template></Column>
                             <Column :header="t('web.network_detail.traffic')"><template #body="{ data }">
                                 <div class="whitespace-nowrap">{{ t('upload') }}: {{ StatusDisplay.trafficBytes(data.conn.stats?.tx_bytes) }}</div>
                                 <div class="whitespace-nowrap">{{ t('download') }}: {{ StatusDisplay.trafficBytes(data.conn.stats?.rx_bytes) }}</div>
                             </template></Column>
-                            <Column :header="t('estimated_bandwidth')"><template #body="{ data }">
-                                <div class="whitespace-nowrap">{{ t('upload') }}: {{ connectionBandwidth(data.conn).upload }}</div>
-                                <div class="whitespace-nowrap">{{ t('download') }}: {{ connectionBandwidth(data.conn).download }}</div>
+                            <Column :header="t('bandwidth_reference_current')"><template #body="{ data }">
+                                <div class="whitespace-nowrap">{{ t('upload') }}: {{ connectionBandwidth(data.conn).upload }} / {{ connectionCurrent(data.conn).upload }}</div>
+                                <div class="whitespace-nowrap">{{ t('download') }}: {{ connectionBandwidth(data.conn).download }} / {{ connectionCurrent(data.conn).download }}</div>
                             </template></Column>
                         </DataTable>
                         </details>

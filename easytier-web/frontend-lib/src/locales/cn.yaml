@@ -121,6 +121,9 @@ logging_copy_dir: 复制日志路径
 vpn_tile_no_network: 没有已配置的网络
 vpn_tile_no_network_description: 请先在 EasyTier 中配置网络，再使用 VPN 快捷磁贴。
 vpn_tile_started: VPN 网络已启动
+management_warning: 网络管理警告
+management_persistence_warning: 配置未能保存，已执行的网络操作不会因此撤销
+management_reconciliation_warning: 网络或 VPN 状态需要重新同步
 vpn_tile_stopped: VPN 网络已停止
 vpn_tile_action_failed: 'VPN 磁贴操作失败：{error}'
 disable_auto_launch: 关闭开机自启
@@ -175,6 +178,18 @@ sni: SNI 伪装主机名
 sni_placeholder: 例如：www.cloudflare.com
 parallel_connections: 并行连接数
 parallel_connections_help: "范围 1–16，默认 1。双方取平均数四舍五入；任意一端禁用或对端不支持时使用单连接。"
+enable_udp_fec: UDP 前向纠错
+enable_udp_fec_help: "在 UDP 连接上直接恢复丢失的数据包，无需等待重传。任一端开启即双向生效，按固定比例发送修复包，会额外占用带宽。HTTP3 隧道的纠错由“禁用 HTTP3 前向纠错”单独控制。"
+enable_udp_fec_kcp: 纠错包含 KCP 代理流量
+enable_udp_fec_kcp_help: "UDP 前向纠错生效时，同时保护 UDP 连接上的 KCP 代理数据包。"
+enable_udp_fec_quic: 纠错包含 QUIC 代理流量
+enable_udp_fec_quic_help: "UDP 前向纠错生效时，同时保护 UDP 连接上的 QUIC 代理数据包。"
+http3_streams: HTTP3 隧道流数
+http3_streams_help: "范围 1–32，默认 8。不同连接按五元组分到一条 HTTP3 连接内的多条可靠流上，同一连接始终在同一条流上，丢包只会阻塞同一条流上的连接。两端取较小值；1 表示全部走一条流。"
+http3_fec_ratio: HTTP3 纠错冗余比例 (%)
+disable_http3_fec: 禁用 HTTP3 前向纠错
+disable_http3_fec_help: "HTTP3 隧道底层的前向纠错默认开启，与 UDP 前向纠错开关无关，任一端开启即双向生效。自适应模式下线路干净时不发修复包，只多出每个数据报 8 字节的校验尾和每 50 毫秒一次的接收报告。"
+http3_fec_ratio_help: "纠错生效时 HTTP3 隧道每 100 个数据包附加的修复包数，范围 1–100。0（默认）按对端实测的丢包率自适应：线路干净时不发修复包，丢包越多冗余越高。"
 disable_parallel_connections: 禁用多连接并发
 disable_parallel_connections_help: "使用单连接传输，保留已填写的并行连接数；任意一端禁用即生效。"
 traffic_disguise: WSS / HTTP3 流量风格
@@ -188,13 +203,17 @@ total_traffic: 总流量
 estimated_bandwidth: 带宽参考
 estimated_bandwidth_help: "根据最近业务流量和传输窗口得到的参考值，并非测速结果，也不会发送测试流量。多连接不累加；UDP 等无窗口传输在空闲、轻载或缺少饱和样本时显示未知。"
 loss_rate: 丢包率
+bandwidth_reference_current: 带宽参考/实时带宽
+bandwidth_reference_current_help: "斜杠前是带宽参考：根据最近业务流量和传输窗口得到的参考值，并非测速结果，也不会发送测试流量，多连接不累加；UDP 等无窗口传输在空闲、轻载或缺少饱和样本时显示未知。斜杠后是实时带宽：最近一次采样（约 0.5–5 秒）里实际收发的速率，多连接时累加。"
+current_bandwidth: 实时带宽
+loss_rate_split_help: "启用 FEC 的 HTTP3 隧道显示为“隧道内/隧道外”：隧道内是隧道自身流量的丢包，隧道外是承载隧道的 UDP 数据报在 FEC 修复前的丢包。其他连接只显示隧道内丢包。"
 nat_type: NAT 类型
 
 flags_switch: 功能开关
 advanced_lock: 锁定高级设置
 advanced_unlock: 解锁高级设置
-advanced_locked_hint: 已锁定：控制台的批量编辑不会修改这份配置的高级设置、功能开关和启停状态
-advanced_unlocked_hint: 锁定后，控制台的批量编辑不会修改这份配置的高级设置、功能开关和启停状态
+advanced_locked_hint: 已锁定：控制台的批量编辑不会修改这份配置的高级设置、功能开关和访问控制
+advanced_unlocked_hint: 锁定后，控制台的批量编辑不会修改这份配置的高级设置、功能开关和访问控制
 
 latency_first: 开启延迟优先模式
 latency_first_help: 忽略中转跳数，选择总延迟最低的路径
@@ -292,11 +311,6 @@ disable_sym_hole_punching_help: 禁用对称NAT的打洞（生日攻击），将
 enable_magic_dns: 启用魔法DNS
 enable_magic_dns_help: |
   启用魔法DNS，允许通过EasyTier的DNS服务器访问其他节点的虚拟IPv4地址， 如 node1.et.net。
-tld_dns_zone: DNS域名后缀
-tld_dns_zone_help: |
-  自定义魔法DNS的顶级域名（TLD）后缀。默认为 "et.net."。
-  如需使用其他域名后缀，可改为 "et.internal." 或 "easytier.lan" 等。
-tld_dns_zone_placeholder: 例如 et.net.
 enable_private_mode: 启用私有模式
 enable_private_mode_help: |
   启用私有模式，则不允许使用了与本网络不相同的网络名称和密码的节点通过本节点进行握手或中转。
@@ -423,6 +437,9 @@ web:
     location: "位置"
     console: "管理控制台"
     workspace: "工作空间"
+    nav_networks: "网络"
+    all_networks: "全部网络"
+    breadcrumb: "当前位置"
     navigation: "导航"
     documentation: "使用文档"
     language: "切换语言"
@@ -436,9 +453,10 @@ web:
     device_note: "注册过的设备总数"
     online_device_note: "当前在线的设备数量"
     delete_device: "删除设备"
-    set_alias: "设置别名"
-    alias_dialog_title: "设置设备别名"
-    alias_hint: "别名将在控制台中替代主机名显示，留空即清除。"
+    rename: "修改名称"
+    rename_hint: "点击修改名称（别名），留空则显示主机名。"
+    edit: "编辑"
+    delete: "删除"
     delete_device_confirm: "确定删除设备 {device}？若它在网络中，将被移出并回收托管配置。"
     block_device: "同时拉黑该设备"
     block_device_hint: "拉黑后该设备将无法重新接入，可在顶栏通知中解除。"
@@ -688,6 +706,12 @@ web:
     ttl_24h: 1 天
     ttl_7d: 7 天
     ttl_30d: 30 天
+    ttl_permanent: 永久
+    ttl_custom: 自定义
+    ttl_hours: 小时
+    ttl_days: 天
+    ttl_unit: 单位
+    ttl_custom_hint: 最长 365 天
     credential_reusable_hint: 取消勾选则同一凭证同时只允许一台设备在线
     credential_secret_hint: "凭证密钥（已保存，可随时在凭证列表中查看）："
     join_command: 临时设备加入命令
@@ -794,20 +818,38 @@ web:
     apply_settings: 保存并下发
     discard: 放弃修改
     delete: 删除网络
-    delete_hint: 删除控制台保存的预下发配置、临时设备和凭证。成员设备上的配置会保留但全部暂停，离线成员在下次上线时暂停；已锁定的成员保持原状。
+    delete_hint: 删除控制台保存的预下发配置、临时设备和凭证。成员设备上的配置会保留但全部暂停，离线成员在下次上线时暂停。
     delete_confirm: 删除网络 {name}？成员设备上的配置会保留并暂停，临时设备会被移除。
     delete_done: '{count} 个成员已暂停或将在上线时暂停，{failed} 个失败'
     advanced_hint: 只会写入你改动过的设置，没动过的设置保持每个成员各自的值。已锁定的成员会被跳过；离线成员在下次上线时补发一次，期间在设备上手动改过的也会被覆盖，只有其他控制台更晚的修改会保留。每项下方是当前成员的取值分布。
     apply_advanced: 应用 {count} 项到 {members} 个成员
     locked_skipped: '{count} 个已锁定，跳过'
     parameters: 传输参数
+    category: 设置分类
+    category_all: 全部
+    category_network: 网络
+    category_p2p: P2P 与打洞
+    category_relay: 中继
+    category_proxy: KCP / QUIC 代理
+    category_transport: 传输与连接
+    category_disguise: 流量伪装
     compression: 压缩算法
     compress_none: 不压缩
     compress_zstd: Zstd
-    value_keep: 不改
+    prefer_tcp: 优先 TCP
+    prefer_udp: 优先 UDP
+    disguise_prefer: 优先伪装
+    disguise_off: 不主动伪装
+    disguise_disabled: 禁用伪装
+    disguise_only: 强制伪装
     value_default: 默认
     value_on: 开
     value_off: 关
+    value_default_is: 默认（{value}）
+    value_mixed: 各不相同
+    value_unsupported: 不支持
+    unsupported_hint: 这些设备的 EasyTier 版本不能保存这项设置，批量修改会跳过它们
+    revert_edit: 撤销修改
     preset_hint: 新设备加入网络时使用的初始配置，只对新加入的设备生效，不会修改或覆盖已有成员。
     preset_core_hint: 网络名称、密码、安全模式、加密和显示名称取网络当前的核心设置；虚拟 IP 使用 DHCP 自动分配，网络有网段时在网段内分配。
     listeners: 监听地址
@@ -816,7 +858,10 @@ web:
     auto_join_hint: 开启后，第一次连上本控制台的设备会按预下发配置自动加入并启动，每台设备只加入一次；开启前已经连接过的设备不会自动加入。
     auto_join_on: 自动加入
     members: 成员
-    members_hint: 启动/停止只作用于选中的在线成员，已锁定的成员不会被批量操作。点击设备名在当前页面打开设备管理。
+    members_hint: 启动/停止只作用于选中的在线成员；锁定只保护高级设置和访问控制，不影响启停。成员名称与设备列表中的名称一致。
+    clients: 未接入控制台的客户端
+    clients_hint: 从成员的路由表中发现，包括经过中转的客户端。它们不受控制台管理，访问控制只能按虚拟 IP 限制它们的来源。
+    acl_client: 客户端
     locked: 已锁定
     pending: 待补发
     pending_hint: 修改时该成员离线，下次上线时补发一次（覆盖期间的手动修改，其他控制台更晚的修改除外）；补发之后在设备上的修改不会被改回
@@ -846,6 +891,7 @@ web:
     running: 运行中
     stopped: 已停止
     offline: 离线
+    failed: 运行出错
     scan_partial: '{count} 台设备的配置暂时无法读取'
     no_members: 当前没有设备运行或保存了该网络
     display_name: 网络显示名称
@@ -1046,24 +1092,3 @@ disable_relay_data: 不转发数据
 disable_relay_data_help: 不转发其他节点的数据包，本节点不承载自身以外的流量。
 prefer_peer_relay: 优先凭证节点转发
 prefer_peer_relay_help: 优先通过已经转发到目标节点的凭证节点转发，而不是为同一目标再通告一条直连路径。
-
-vpn_section: 网段出口 VPN
-vpn_section_help: 将指定目标网段交给单个出口节点。最长前缀优先；组网、子网代理和手动路由保留原路径。出口不可用时丢弃匹配流量。
-vpn_rules: 分流规则
-vpn_add_rule: 添加规则
-vpn_no_rules: 暂无规则
-vpn_rule_cidr: 目标网段
-vpn_rule_exit: 出口虚拟 IP
-vpn_rule_exit_placeholder: 留空则使用出口节点列表
-vpn_rule_exit_nodes: 出口节点列表
-vpn_rule_state: 出口状态
-vpn_rule_remove: 删除规则
-vpn_status_title: VPN 运行状态
-vpn_status_enabled: 已启用
-vpn_status_disabled: 未启用
-vpn_status_routes: 系统路由
-vpn_status_routes_active: 已接管
-vpn_status_routes_inactive: 未接管
-vpn_status_routes_count: 已安装 {count} 条路由
-vpn_exit_state_up: 可用
-vpn_exit_state_down: 不可用

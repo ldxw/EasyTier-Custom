@@ -121,6 +121,9 @@ logging_copy_dir: Copy Log Path
 vpn_tile_no_network: No configured network
 vpn_tile_no_network_description: Configure a network in EasyTier before using the VPN tile.
 vpn_tile_started: VPN network started
+management_warning: Network management warning
+management_persistence_warning: Configuration could not be saved; this does not undo the runtime operation
+management_reconciliation_warning: Runtime or VPN state needs reconciliation
 vpn_tile_stopped: VPN network stopped
 vpn_tile_action_failed: 'VPN tile action failed: {error}'
 disable_auto_launch: Disable Launch on Reboot
@@ -174,6 +177,18 @@ parallel_connections: Parallel connections
 parallel_connections_help: "1–16, default 1. Peers use the rounded average; either peer disabling concurrency or lacking support keeps one connection."
 disable_parallel_connections: Disable parallel connections
 disable_parallel_connections_help: "Use one connection while retaining the configured count. Disabling on either peer takes effect."
+enable_udp_fec: UDP forward error correction
+enable_udp_fec_help: "Recover lost packets on UDP connections without waiting for a retransmission. Either peer enabling it protects both directions; it sends repairs at a fixed rate and costs extra bandwidth. HTTP3 tunnels have their own switch, Disable HTTP3 FEC."
+enable_udp_fec_kcp: Include KCP proxy traffic in FEC
+enable_udp_fec_kcp_help: "When UDP FEC is active, also protect KCP proxy packets on UDP connections."
+enable_udp_fec_quic: Include QUIC proxy traffic in FEC
+enable_udp_fec_quic_help: "When UDP FEC is active, also protect QUIC proxy packets on UDP connections."
+http3_streams: HTTP3 streams per tunnel
+http3_streams_help: "1–32, default 8. Flows are spread over this many reliable streams of one HTTP3 connection, each flow staying on one, so a lost packet only holds back the flows on its stream. The smaller end's value is used; 1 keeps everything on one stream."
+http3_fec_ratio: HTTP3 FEC redundancy (%)
+disable_http3_fec: Disable HTTP3 FEC
+disable_http3_fec_help: "FEC below HTTP3 tunnels is on by default and independent of UDP FEC; either end enabling it protects both directions. In adaptive mode a clean path sends no repairs, only an 8-byte trailer per datagram and a receive report every 50 ms."
+http3_fec_ratio_help: "Repair packets per 100 packets on HTTP3 tunnels while FEC is active, 1–100. 0 (default) follows the loss the peer measures: nothing on a clean path, more as loss rises."
 traffic_disguise: WSS / HTTP3 traffic style
 traffic_disguise_speedtest: Speed test
 traffic_disguise_video: Video
@@ -187,13 +202,17 @@ total_traffic: Total Traffic
 estimated_bandwidth: Bandwidth Reference
 estimated_bandwidth_help: "A reference derived from recent business traffic and transport windows, not a speed test; no probe traffic is sent. Parallel connections are not added together. Windowless transports such as UDP show unknown while idle, lightly loaded, or without saturation samples."
 loss_rate: Loss Rate
+bandwidth_reference_current: Bandwidth Reference / Current
+bandwidth_reference_current_help: "Before the slash, the bandwidth reference: derived from recent business traffic and transport windows, not a speed test; no probe traffic is sent and parallel connections are not added together. Windowless transports such as UDP show unknown while idle, lightly loaded, or without saturation samples. After the slash, the current rate: what moved in the latest sample (about 0.5–5 s), added up over parallel connections."
+current_bandwidth: Current Rate
+loss_rate_split_help: "HTTP3 tunnels with FEC show inside/outside: the loss of the tunnel's own traffic, then the loss of the UDP datagrams carrying it before FEC repaired them. Other connections show the inside loss only."
 nat_type: NAT Type
 
 flags_switch: Feature Switch
 advanced_lock: Lock advanced settings
 advanced_unlock: Unlock advanced settings
-advanced_locked_hint: "Locked: the console's batch edits leave this configuration's advanced settings, switches and running state alone"
-advanced_unlocked_hint: Lock to keep the console's batch edits away from this configuration's advanced settings, switches and running state
+advanced_locked_hint: "Locked: the console's batch edits leave this configuration's advanced settings, switches and access control alone"
+advanced_unlocked_hint: Lock to keep the console's batch edits away from this configuration's advanced settings, switches and access control
 
 latency_first: Enable Latency-First Mode
 latency_first_help: Ignore hop count and select the path with the lowest total latency
@@ -291,11 +310,6 @@ disable_sym_hole_punching_help: Disable special hole punching handling for symme
 enable_magic_dns: Enable Magic DNS
 enable_magic_dns_help: |
   Enable magic dns, all nodes in the network can access each other by domain name, e.g.: node1.et.net.
-tld_dns_zone: DNS Zone TLD
-tld_dns_zone_help: |
-  Custom top-level domain (TLD) zone for Magic DNS hostnames. Default is "et.net.".
-  Change this if you need a different domain suffix, e.g. "et.internal." or "easytier.lan".
-tld_dns_zone_placeholder: e.g. et.net.
 enable_private_mode: Enable Private Mode
 enable_private_mode_help: |
   Enable private mode, nodes with different network names or passwords from this network are not allowed to perform handshake or relay through this node.
@@ -423,6 +437,9 @@ web:
     location: "Location"
     console: "Management console"
     workspace: "Workspace"
+    nav_networks: "Networks"
+    all_networks: "All networks"
+    breadcrumb: "Breadcrumb"
     navigation: "Navigation"
     documentation: "Documentation"
     language: "Switch language"
@@ -436,9 +453,10 @@ web:
     device_note: "Total registered devices"
     online_device_note: "Devices currently online"
     delete_device: "Delete Device"
-    set_alias: "Set Alias"
-    alias_dialog_title: "Set Device Alias"
-    alias_hint: "The alias is shown in place of the hostname across the console. Leave empty to clear."
+    rename: "Rename"
+    rename_hint: "Click to rename (the alias). Leave empty to show the hostname."
+    edit: "Edit"
+    delete: "Delete"
     delete_device_confirm: "Delete device {device}? It will be removed from its networks and its managed configs withdrawn."
     block_device: "Also block this device"
     block_device_hint: "A blocked device cannot re-register; unblock it from the bell menu."
@@ -688,6 +706,12 @@ web:
     ttl_24h: 1 day
     ttl_7d: 7 days
     ttl_30d: 30 days
+    ttl_permanent: Permanent
+    ttl_custom: Custom
+    ttl_hours: hours
+    ttl_days: days
+    ttl_unit: Unit
+    ttl_custom_hint: Up to 365 days
     credential_reusable_hint: "Unchecked means only one device may use the credential at a time"
     credential_secret_hint: "Credential secret (saved and always visible in the credential list):"
     join_command: Temporary device join command
@@ -794,20 +818,38 @@ web:
     apply_settings: Save and apply
     discard: Discard changes
     delete: Delete network
-    delete_hint: Deletes the preset, temporary devices and credentials the console keeps. Members keep their configurations but are paused; offline members are paused when they next connect, and locked members are left alone.
+    delete_hint: Deletes the preset, temporary devices and credentials the console keeps. Members keep their configurations but are paused; offline members are paused when they next connect.
     delete_confirm: Delete network {name}? Members keep their configurations and are paused; temporary devices are removed.
     delete_done: '{count} member(s) paused or paused when they connect, {failed} failed'
     advanced_hint: Only the settings you change are written; every other setting keeps each member's own value. Locked members are skipped; offline members receive the change once when they next connect, overwriting edits made on the device meanwhile unless another console changed them later. Below each setting is how current members hold it.
     apply_advanced: Apply {count} setting(s) to {members} member(s)
     locked_skipped: '{count} locked, skipped'
     parameters: Transport parameters
+    category: Setting category
+    category_all: All
+    category_network: Network
+    category_p2p: P2P and hole punching
+    category_relay: Relay
+    category_proxy: KCP / QUIC proxy
+    category_transport: Transport and connections
+    category_disguise: Traffic disguise
     compression: Compression
     compress_none: None
     compress_zstd: Zstd
-    value_keep: Keep
+    prefer_tcp: Prefer TCP
+    prefer_udp: Prefer UDP
+    disguise_prefer: Prefer disguise
+    disguise_off: Do not initiate
+    disguise_disabled: Disabled
+    disguise_only: Require disguise
     value_default: Default
     value_on: 'On'
     value_off: 'Off'
+    value_default_is: Default ({value})
+    value_mixed: Mixed
+    value_unsupported: Unsupported
+    unsupported_hint: The EasyTier version on these devices cannot store this setting; batch edits skip them
+    revert_edit: Undo change
     preset_hint: The configuration a device starts with when it joins. It only reaches devices that join; existing members are never changed.
     preset_core_hint: Network name, secret, secure mode, encryption and display name come from the network's current core settings; the virtual IP is assigned by DHCP, within the network's subnet when it has one.
     listeners: Listeners
@@ -816,7 +858,10 @@ web:
     auto_join_hint: When on, a device connecting to this console for the first time joins with the preset and starts, once. Devices that connected before it was switched on never join on their own.
     auto_join_on: Auto join
     members: Members
-    members_hint: Start and stop apply to the selected online members; locked members are never part of a batch. Click a device to manage it over this page.
+    members_hint: Start and stop apply to the selected online members; a lock only guards advanced settings and access control, not start and stop. Members show the name they have in the device list.
+    clients: Clients not connected to the console
+    clients_hint: Found in the members' route tables, relayed ones included. The console does not manage them, so access control can only restrict them as a source by virtual IP.
+    acl_client: Client
     locked: Locked
     pending: Pending
     pending_hint: This member was offline during a change; it receives the change once when it next connects, overwriting edits made meanwhile unless another console changed it later. Edits after that are kept
@@ -846,6 +891,7 @@ web:
     running: Running
     stopped: Stopped
     offline: Offline
+    failed: Failed
     scan_partial: 'Configurations of {count} device(s) are temporarily unavailable'
     no_members: No device runs or saves this network
     display_name: Network display name
@@ -1046,24 +1092,3 @@ disable_relay_data: Disable Data Relay
 disable_relay_data_help: Do not relay data packets for other peers, so this node carries no traffic it did not originate.
 prefer_peer_relay: Prefer Peer Relay
 prefer_peer_relay_help: Prefer a credential peer that already relays to a destination over advertising another direct edge to the same destination.
-
-vpn_section: Subnet Exit VPN
-vpn_section_help: Route each destination subnet through one exit node. The longest prefix wins; mesh, subnet proxy and manual routes retain their paths. Matching traffic is dropped while its exit is unavailable.
-vpn_rules: Subnet rules
-vpn_add_rule: Add rule
-vpn_no_rules: No rules
-vpn_rule_cidr: Destination CIDR
-vpn_rule_exit: Exit virtual IP
-vpn_rule_exit_placeholder: Empty uses the exit nodes list
-vpn_rule_exit_nodes: Exit nodes list
-vpn_rule_state: Exit state
-vpn_rule_remove: Remove rule
-vpn_status_title: VPN status
-vpn_status_enabled: Enabled
-vpn_status_disabled: Disabled
-vpn_status_routes: System routes
-vpn_status_routes_active: taken over
-vpn_status_routes_inactive: not taken over
-vpn_status_routes_count: "{count} routes installed"
-vpn_exit_state_up: Available
-vpn_exit_state_down: Unavailable

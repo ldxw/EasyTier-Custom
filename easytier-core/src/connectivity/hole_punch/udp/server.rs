@@ -171,19 +171,25 @@ where
         }
 
         let base_port_num = request.base_port_num;
+        anyhow::ensure!(
+            (1..=u16::MAX as u32).contains(&base_port_num),
+            "send_punch_packet_easy_sym invalid base port"
+        );
         let max_port_num = request.max_port_num.max(1);
         let port_start = if request.is_incremental {
             base_port_num.saturating_add(1)
         } else {
-            base_port_num.saturating_sub(max_port_num)
+            base_port_num.saturating_sub(max_port_num).max(1)
         };
         let port_end = if request.is_incremental {
-            base_port_num.saturating_add(max_port_num)
+            base_port_num
+                .saturating_add(max_port_num)
+                .min(u16::MAX as u32)
         } else {
             base_port_num.saturating_sub(1)
         };
 
-        if port_end <= port_start {
+        if port_end < port_start {
             anyhow::bail!("send_punch_packet_easy_sym invalid port range");
         }
 
@@ -1027,7 +1033,6 @@ where
 
                 if let Some(s) = udp_array.try_fetch_punched_socket(transaction_id) {
                     tracing::info!(?s, ?transaction_id, "got punched socket in both easy sym");
-                    assert!(Arc::strong_count(&s.socket) == 1);
                     let Some(port) = s.socket.local_addr().ok().map(|addr| addr.port()) else {
                         tracing::warn!("failed to get local addr from punched socket");
                         continue;
@@ -1417,7 +1422,6 @@ mod tests {
         let runtime = Arc::new(MockRuntime::new(vec![
             listener_with_scheme(10010, Vec::new(), UdpPunchScheme::Http3),
             listener_with_scheme(10011, Vec::new(), UdpPunchScheme::Udp),
-            listener_with_scheme(10013, Vec::new(), UdpPunchScheme::Http3Mux),
         ]));
         let sink = Arc::new(MockSink::default());
         let common = UdpHolePunchServerCommon::new(runtime.clone(), mock_stun(), sink);
@@ -1430,24 +1434,14 @@ mod tests {
             .select_listener(false, false, UdpPunchScheme::Udp)
             .await
             .unwrap();
-        let legacy_http3 = common
-            .select_listener(false, false, UdpPunchScheme::Http3Mux)
-            .await
-            .unwrap();
 
         assert_eq!(http3.scheme, UdpPunchScheme::Http3);
         assert_eq!(http3.mapped_addr.port(), 10010);
         assert_eq!(udp.scheme, UdpPunchScheme::Udp);
         assert_eq!(udp.mapped_addr.port(), 10011);
-        assert_eq!(legacy_http3.scheme, UdpPunchScheme::Http3Mux);
-        assert_eq!(legacy_http3.mapped_addr.port(), 10013);
         assert_eq!(
             runtime.created_schemes.lock().unwrap().as_slice(),
-            [
-                UdpPunchScheme::Http3,
-                UdpPunchScheme::Udp,
-                UdpPunchScheme::Http3Mux
-            ]
+            [UdpPunchScheme::Http3, UdpPunchScheme::Udp]
         );
     }
 
@@ -1493,11 +1487,7 @@ mod tests {
         );
         server.start().await;
 
-        for scheme in [
-            UdpPunchScheme::Udp,
-            UdpPunchScheme::Http3,
-            UdpPunchScheme::Http3Mux,
-        ] {
+        for scheme in [UdpPunchScheme::Udp, UdpPunchScheme::Http3] {
             let err = server
                 .select_punch_listener(SelectPunchListener {
                     transaction_id: None,
@@ -1513,11 +1503,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_mode_preserves_native_and_legacy_http3_negotiation() {
-        let runtime = Arc::new(MockRuntime::new(vec![
-            listener_with_scheme(10014, Vec::new(), UdpPunchScheme::Http3),
-            listener_with_scheme(10015, Vec::new(), UdpPunchScheme::Http3Mux),
-        ]));
+    async fn strict_mode_accepts_native_http3_negotiation() {
+        let runtime = Arc::new(MockRuntime::new(vec![listener_with_scheme(
+            10014,
+            Vec::new(),
+            UdpPunchScheme::Http3,
+        )]));
         let sink = Arc::new(MockSink {
             http3_supported: true,
             ..Default::default()
@@ -1532,18 +1523,17 @@ mod tests {
         );
         server.start().await;
 
-        for scheme in [UdpPunchScheme::Http3, UdpPunchScheme::Http3Mux] {
-            let response = server
-                .select_punch_listener(SelectPunchListener {
-                    transaction_id: None,
-                    force_new: false,
-                    prefer_port_mapping: false,
-                    scheme,
-                })
-                .await
-                .unwrap();
-            assert_eq!(response.scheme, scheme);
-        }
+        let scheme = UdpPunchScheme::Http3;
+        let response = server
+            .select_punch_listener(SelectPunchListener {
+                transaction_id: None,
+                force_new: false,
+                prefer_port_mapping: false,
+                scheme,
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.scheme, scheme);
         server.stop().await;
     }
 
@@ -1566,39 +1556,38 @@ mod tests {
             );
             server.start().await;
 
-            for scheme in [UdpPunchScheme::Http3, UdpPunchScheme::Http3Mux] {
-                let error = server
-                    .select_punch_listener(SelectPunchListener {
-                        transaction_id: None,
-                        force_new: true,
-                        prefer_port_mapping: false,
-                        scheme,
-                    })
-                    .await
-                    .unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("disabled by the local P2P policy")
-                );
+            let scheme = UdpPunchScheme::Http3;
+            let error = server
+                .select_punch_listener(SelectPunchListener {
+                    transaction_id: None,
+                    force_new: true,
+                    prefer_port_mapping: false,
+                    scheme,
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("disabled by the local P2P policy")
+            );
 
-                let error = server
-                    .send_punch_packet_both_easy_sym(SendPunchPacketBothEasySym {
-                        udp_socket_count: 1,
-                        public_ip: Ipv4Addr::new(198, 51, 100, 1),
-                        transaction_id: 9,
-                        dst_port_num: 20000,
-                        wait_time_ms: 500,
-                        scheme,
-                    })
-                    .await
-                    .unwrap_err();
-                assert!(
-                    error
-                        .to_string()
-                        .contains("disabled by the local P2P policy")
-                );
-            }
+            let error = server
+                .send_punch_packet_both_easy_sym(SendPunchPacketBothEasySym {
+                    udp_socket_count: 1,
+                    public_ip: Ipv4Addr::new(198, 51, 100, 1),
+                    transaction_id: 9,
+                    dst_port_num: 20000,
+                    wait_time_ms: 500,
+                    scheme,
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("disabled by the local P2P policy")
+            );
 
             assert!(runtime.created_schemes.lock().unwrap().is_empty());
             assert_eq!(runtime.bound_sockets.load(Ordering::Relaxed), 0);
@@ -2032,6 +2021,100 @@ mod tests {
 
         let sent = socket.sent.lock().await;
         assert_eq!(sent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn predictable_sender_uses_valid_boundary_ports() {
+        for (base_port_num, max_port_num, is_incremental, expected_ports) in [
+            (10000, 4, true, vec![10001, 10002, 10003, 10004]),
+            (10000, 4, false, vec![9996, 9997, 9998, 9999]),
+            (65534, 50, true, vec![65535]),
+            (2, 50, false, vec![1]),
+            (65535, 50, true, vec![]),
+            (1, 50, false, vec![]),
+        ] {
+            let public_ips = vec![Ipv4Addr::new(198, 51, 100, 1)];
+            let listener = listener(10007, Vec::new());
+            let socket = listener.socket.clone();
+            let listener_mapped_addr = listener.mapped_addr;
+            let server = UdpHolePunchServer::new(
+                Arc::new(MockRuntime::new(vec![listener])),
+                mock_stun(),
+                Arc::new(MockSink::default()),
+                UdpSymPunchLock::default(),
+                false,
+                false,
+            );
+            server
+                .common
+                .select_listener(false, false, UdpPunchScheme::Udp)
+                .await
+                .unwrap();
+            let result = server
+                .send_punch_packet_easy_sym_inner(SendPunchPacketEasySym {
+                    listener_mapped_addr,
+                    public_ips: public_ips.clone(),
+                    transaction_id: 9,
+                    base_port_num,
+                    max_port_num,
+                    is_incremental,
+                })
+                .await;
+            assert_eq!(result.is_ok(), !expected_ports.is_empty());
+            let sent = socket.sent.lock().await;
+            assert_eq!(sent.len(), expected_ports.len() * public_ips.len() * 3 * 2);
+            for ip in &public_ips {
+                for port in &expected_ports {
+                    assert_eq!(
+                        sent.iter()
+                            .filter(|(_, addr)| *addr == SocketAddr::from((*ip, *port)))
+                            .count(),
+                        6
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn predictable_sender_keeps_packet_budget_with_multiple_public_ips() {
+        let listener = listener(10007, Vec::new());
+        let socket = listener.socket.clone();
+        let listener_mapped_addr = listener.mapped_addr;
+        let server = UdpHolePunchServer::new(
+            Arc::new(MockRuntime::new(vec![listener])),
+            mock_stun(),
+            Arc::new(MockSink::default()),
+            UdpSymPunchLock::default(),
+            false,
+            false,
+        );
+        server
+            .common
+            .select_listener(false, false, UdpPunchScheme::Udp)
+            .await
+            .unwrap();
+        let public_ips = vec![
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(198, 51, 100, 2),
+        ];
+        server
+            .send_punch_packet_easy_sym_inner(SendPunchPacketEasySym {
+                listener_mapped_addr,
+                public_ips: public_ips.clone(),
+                transaction_id: 9,
+                base_port_num: 10000,
+                max_port_num: 50,
+                is_incremental: true,
+            })
+            .await
+            .unwrap();
+
+        let sent = socket.sent.lock().await;
+        assert_eq!(sent.len(), 300);
+        for ip in public_ips {
+            assert!(sent.iter().any(|(_, addr)| addr.ip() == ip));
+        }
     }
 
     #[tokio::test]

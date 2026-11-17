@@ -90,8 +90,7 @@ macro_rules! advanced_fields {
 }
 
 // Left out on purpose: exit forwarding, TUN, smoltcp, device binding and
-// system forwarding describe one device; private mode keeps its default;
-// encryption is a core setting.
+// system forwarding describe one device; encryption is a core setting.
 advanced_fields! {
     bool: [
         latency_first,
@@ -103,6 +102,7 @@ advanced_fields! {
         multi_thread,
         disable_udp_hole_punching,
         enable_magic_dns,
+        enable_private_mode,
         enable_quic_proxy,
         disable_quic_input,
         disable_sym_hole_punching,
@@ -116,13 +116,30 @@ advanced_fields! {
         prefer_peer_relay,
         close_redundant_conns_when_disguised,
         disable_parallel_connections,
+        enable_udp_fec,
+        enable_udp_fec_kcp,
+        enable_udp_fec_quic,
+        disable_http3_fec,
     ],
     other: [
         data_compress_algo: int,
         mtu: int,
         traffic_disguise: text,
         parallel_connections: int,
+        http3_fec_ratio: int,
+        http3_streams: int,
+        p2p_prefer_protocol: text,
+        p2p_disguise_mode: text,
     ]
+}
+
+/// The values a text setting may take; the core rejects anything else.
+fn choices(field: &str) -> Option<&'static [&'static str]> {
+    match field {
+        "p2p_prefer_protocol" => Some(&["tcp", "udp"]),
+        "p2p_disguise_mode" => Some(&["prefer", "off", "disabled", "only"]),
+        _ => None,
+    }
 }
 
 /// Every advanced setting `config` holds.
@@ -146,6 +163,27 @@ pub fn validate(change: &AdvancedChange) -> anyhow::Result<()> {
             continue;
         }
         set(&mut probe, field, value)?;
+        if field == "http3_fec_ratio" {
+            anyhow::ensure!(
+                probe.http3_fec_ratio.is_none_or(|ratio| ratio <= 100),
+                "http3_fec_ratio must be between 0 and 100"
+            );
+        }
+        if field == "http3_streams" {
+            anyhow::ensure!(
+                probe
+                    .http3_streams
+                    .is_none_or(|streams| (1..=32).contains(&streams)),
+                "http3_streams must be between 1 and 32"
+            );
+        }
+        if let (Some(choices), Some(text)) = (choices(field), value.as_str()) {
+            anyhow::ensure!(
+                choices.contains(&text),
+                "{field} must be one of {}",
+                choices.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -285,10 +323,36 @@ mod tests {
     #[test]
     fn rejects_device_settings_and_wrong_types() {
         assert!(validate(&change(&[("enable_exit_node", json!(true))])).is_err());
-        assert!(validate(&change(&[("enable_private_mode", json!(true))])).is_err());
+        assert!(validate(&change(&[("use_smoltcp", json!(true))])).is_err());
+        assert!(validate(&change(&[("enable_private_mode", json!(true))])).is_ok());
         assert!(validate(&change(&[("latency_first", json!(1))])).is_err());
         assert!(validate(&change(&[("mtu", json!("1300"))])).is_err());
         assert!(validate(&change(&[("mtu", json!(1300)), ("lazy_p2p", Value::Null)])).is_ok());
+    }
+
+    #[test]
+    fn p2p_protocol_and_disguise_take_only_what_the_core_knows() {
+        assert!(validate(&change(&[("p2p_prefer_protocol", json!("tcp"))])).is_ok());
+        assert!(validate(&change(&[("p2p_prefer_protocol", json!("http3"))])).is_err());
+        assert!(validate(&change(&[("p2p_disguise_mode", json!("only"))])).is_ok());
+        assert!(validate(&change(&[("p2p_disguise_mode", json!("always"))])).is_err());
+        assert!(validate(&change(&[("p2p_disguise_mode", Value::Null)])).is_ok());
+
+        // A node without the capability keeps its own value.
+        let edit = change(&[
+            ("p2p_disguise_mode", json!("off")),
+            ("p2p_prefer_protocol", json!("tcp")),
+        ]);
+        assert!(
+            patch(&NetworkConfig::default(), &edit, |_| false, None)
+                .unwrap()
+                .is_none()
+        );
+        let (desired, mask) = patch(&NetworkConfig::default(), &edit, |_| true, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mask, ["p2p_disguise_mode", "p2p_prefer_protocol"]);
+        assert_eq!(desired.p2p_disguise_mode.as_deref(), Some("off"));
     }
 
     #[test]

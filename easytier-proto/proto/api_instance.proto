@@ -35,6 +35,10 @@ message PeerConnStats {
   uint64 estimated_tx_bps = 50007;
   // 1 = transmission-window formula. Missing/0 is the retired traffic estimator.
   uint32 bandwidth_estimate_version = 50008;
+  // Traffic rate of the latest sample (about 0.5-5 s), in bit/s. Present
+  // whenever the core samples, so zero means idle and absence an older core.
+  optional uint64 current_rx_bps = 50009;
+  optional uint64 current_tx_bps = 50010;
 }
 
 message PeerConnInfo {
@@ -52,7 +56,13 @@ message PeerConnInfo {
   bytes noise_remote_static_pubkey = 12;
   peer_rpc.SecureAuthLevel secure_auth_level = 13;
   peer_rpc.PeerIdentityType peer_identity_type = 14;
+  PeerConnFecStats fec = 15;
+  // Loss of the datagrams carrying the tunnel before FEC repairs any, where
+  // the tunnel measures it (HTTP3 with FEC). loss_rate stays the loss of the
+  // tunnel's own traffic.
+  optional float link_loss_rate = 50001;
 }
+
 
 message PeerInfo {
   uint32 peer_id = 1;
@@ -196,7 +206,6 @@ service PeerManageRpc {
   rpc ListPeer(ListPeerRequest) returns (ListPeerResponse);
   rpc ListPublicIpv6Info(ListPublicIpv6InfoRequest)
       returns (ListPublicIpv6InfoResponse);
-  rpc GetVpnStatus(GetVpnStatusRequest) returns (GetVpnStatusResponse);
   rpc ListRoute(ListRouteRequest) returns (ListRouteResponse);
   rpc DumpRoute(DumpRouteRequest) returns (DumpRouteResponse);
   rpc ListForeignNetwork(ListForeignNetworkRequest)
@@ -428,37 +437,15 @@ service CredentialManageRpc {
   rpc UpsertCredential(UpsertCredentialRequest) returns (UpsertCredentialResponse);
 }
 
-// Custom subnet exit VPN status (fork feature).
-
-message VpnRuleStatus {
-  string cidr = 50001;
-  reserved 2, 3, 4, 5, 6, 7, 8, 9;
-  reserved "action", "exit", "fallback_exits", "priority", "effective_exit", "packets", "bytes", "exits";
-  string exit_addr = 50010;
-  // up | down
-  string state = 50011;
-}
-
-message GetVpnStatusRequest { InstanceIdentifier instance = 50001; }
-
-message GetVpnStatusResponse {
-  bool enabled = 50001;
-  // this node offers exit forwarding for peers
-  bool exit_enabled = 50002;
-  reserved 3, 6, 7, 10, 11, 12;
-  reserved "exits", "dns_protect", "ipv6_protect", "protected_endpoints", "system_dns_servers", "ignore_private";
-  repeated VpnRuleStatus rules = 50004;
-  reserved 5;
-  reserved "fail_mode";
-  // host-side route manager state, filled when available
-  bool routes_active = 50008;
-  uint32 routes_installed = 50009;
-  // Complete positive TUN routes, including overlay and policy capture.
-  repeated string capture_routes = 50013;
-  // Changes with policy/address context, independently of exit liveness.
-  uint64 policy_generation = 50014;
-  // Actual virtual IPv6 address and prefix, empty if IPv6 is unconfigured.
-  string ipv6_addr = 50015;
-  // Host protection or route setup error; empty after successful activation.
-  string activation_error = 50016;
+message PeerConnFecStats {
+  bool active = 1;
+  uint64 tx_sources = 2;
+  uint64 tx_repairs = 3;
+  uint64 tx_source_bytes = 4;
+  uint64 tx_repair_bytes = 5;
+  uint64 rx_sources = 6;
+  uint64 rx_repairs = 7;
+  uint64 recovered = 8;
+  uint64 duplicates = 9;
+  uint64 invalid_packets = 10;
 }

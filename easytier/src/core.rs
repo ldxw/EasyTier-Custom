@@ -1,3 +1,5 @@
+mod startup;
+
 use crate::{
     ShellType,
     common::{
@@ -5,13 +7,13 @@ use crate::{
             ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, FileLoggerConfig,
             LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig, TomlConfigLoader,
             VpnPortalClientConfig, VpnPortalConfig, add_proxy_network_to_config,
-            load_config_from_file, load_toml_config_from_path,
-            load_toml_config_from_str_with_source, parse_mapped_listener_urls,
+            load_toml_config_from_path, load_toml_config_from_str_with_source,
+            parse_mapped_listener_urls,
         },
         constants::EASYTIER_VERSION,
         log,
     },
-    instance::factory::{NativeInstanceManager, native_cli_instance_manager},
+    instance::factory::native_cli_instance_manager,
     proto::common::{CompressionAlgoPb, Flags, FlagsPatch, SecureModeConfig},
     rpc_service::ApiRpcServer,
     utils::panic::setup_panic_handler,
@@ -43,6 +45,7 @@ use crate::tunnel::IpScheme;
 #[cfg(feature = "jemalloc-prof")]
 use jemalloc_ctl::{Access as _, AsName as _, epoch, stats};
 use serde::Serialize;
+use startup::{prepare_startup_configs, start_prepared_configs};
 
 #[cfg(target_os = "windows")]
 windows_service::define_windows_service!(ffi_service_main, win_service_main);
@@ -473,6 +476,9 @@ struct NetworkOptions {
         help = t!("core_clap.credential_file").to_string()
     )]
     credential_file: Option<PathBuf>,
+
+    #[arg(long, env = "ET_TLD_DNS_ZONE", hide = true)]
+    tld_dns_zone: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -977,7 +983,12 @@ impl NetworkOptions {
             cfg.set_secure_mode(Some(normalize_secure_mode_config(c)?));
         }
 
-        cfg.patch_flags(self.flags.clone());
+        let mut flags = self.flags.clone();
+        #[allow(deprecated)]
+        if flags.tld_dns_zone.is_none() {
+            flags.tld_dns_zone = self.tld_dns_zone.clone();
+        }
+        cfg.patch_flags(flags);
         #[cfg(not(feature = "tun"))]
         cfg.patch_flags(FlagsPatch {
             no_tun: Some(true),
@@ -1280,159 +1291,6 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
         .expect("set service status fail");
 
     win_service_event_loop(stop_notify_recv, cli, status_handle);
-}
-
-struct StartupConfigFile {
-    path: PathBuf,
-    source: ConfigFileSource,
-    config: TomlConfigLoader,
-    control: ConfigFileControl,
-    original_contents: Option<Vec<u8>>,
-}
-
-#[derive(Default)]
-struct StartupConfigs {
-    files: Vec<StartupConfigFile>,
-    explicit_file_count: usize,
-    directory: crate::instance::config_dir_startup::StartupConfigs,
-}
-
-impl StartupConfigs {
-    fn reconcile_state(&self, state: &InstanceStateStore) {
-        self.directory.reconcile_state(state)
-    }
-}
-
-async fn prepare_startup_configs(
-    explicit_files: &[PathBuf],
-    config_dir: Option<&PathBuf>,
-    disable_env_parsing: bool,
-) -> anyhow::Result<StartupConfigs> {
-    let mut startup = StartupConfigs {
-        explicit_file_count: explicit_files.len(),
-        ..Default::default()
-    };
-    // Explicit --config-file errors retain their fatal startup behavior.
-    for path in explicit_files {
-        let original_contents = if path.as_os_str() == "-" {
-            None
-        } else {
-            Some(
-                tokio::fs::read(path)
-                    .await
-                    .with_context(|| format!("failed to read config file {}", path.display()))?,
-            )
-        };
-        let (config, control) = match original_contents.as_ref() {
-            Some(raw) => {
-                crate::common::config::load_config_from_contents(
-                    path,
-                    String::from_utf8(raw.clone())?,
-                    config_dir,
-                    disable_env_parsing,
-                )
-                .await?
-            }
-            None => load_config_from_file(path, config_dir, disable_env_parsing).await?,
-        };
-        startup.files.push(StartupConfigFile {
-            path: path.clone(),
-            source: ConfigFileSource::CliConfigFile,
-            config,
-            control,
-            original_contents,
-        });
-    }
-    let Some(directory) = config_dir else {
-        return Ok(startup);
-    };
-    // The config directory is scanned with the shared isolation policy
-    // (also used by the GUI local backend): invalid entries and duplicate
-    // instance UUIDs are skipped instead of failing the startup.
-    let mut entries = crate::instance::config_dir_startup::load_config_dir_entries(
-        directory,
-        disable_env_parsing,
-    )
-    .await?;
-    startup
-        .files
-        .extend(entries.files.drain(..).map(|file| StartupConfigFile {
-            path: file.path,
-            source: ConfigFileSource::ConfigDir,
-            config: file.config,
-            control: file.control,
-            original_contents: file.original_contents,
-        }));
-    startup.directory = entries;
-    Ok(startup)
-}
-
-fn start_prepared_configs(
-    startup: &mut StartupConfigs,
-    manager: &NativeInstanceManager,
-    state: &InstanceStateStore,
-    options: &NetworkOptions,
-    mut create_cli_network: bool,
-) -> anyhow::Result<bool> {
-    for StartupConfigFile {
-        path,
-        source,
-        config,
-        mut control,
-        original_contents,
-    } in startup.files.drain(..)
-    {
-        let result = (|| -> anyhow::Result<()> {
-            if source == ConfigFileSource::ConfigDir {
-                manager.register_managed_config(config.get_id(), control.clone())?;
-                if !state.is_enabled(&config.get_id()) {
-                    if let Some(contents) = original_contents.as_deref() {
-                        manager
-                            .local_config_catalog()
-                            .acknowledge_file(&path, contents);
-                    }
-                    log::info!(config_file = ?path, id = %config.get_id(), "Skipping config stopped before shutdown; enable it from the web console to run again");
-                    return Ok(());
-                }
-            }
-            if options.can_merge(
-                &config,
-                source,
-                startup.explicit_file_count,
-                startup.directory.config_dir_file_count,
-            ) {
-                options
-                    .merge_into(&config)
-                    .with_context(|| format!("failed to merge config from cli: {path:?}"))?;
-                create_cli_network = false;
-                control.set_read_only(true);
-                control.set_no_delete(true);
-            }
-            log::info!(
-                "Starting easytier from config file {:?}({:?}) with config:\n############### TOML ###############\n{}\n-----------------------------------\n",
-                path,
-                control.permission,
-                config.dump_redacted()
-            );
-            if source == ConfigFileSource::ConfigDir {
-                manager.register_managed_config(config.get_id(), control.clone())?;
-            }
-            manager.run_network_instance(config, control)?;
-            if let Some(contents) = original_contents.as_deref() {
-                manager
-                    .local_config_catalog()
-                    .acknowledge_file(&path, contents);
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            if source == ConfigFileSource::CliConfigFile {
-                return Err(error);
-            }
-            log::warn!(%error, config_file = ?path, "Skipping config directory entry that could not be started");
-        }
-    }
-    Ok(create_cli_network)
 }
 
 async fn run_main(mut cli: Cli) -> anyhow::Result<()> {
@@ -1765,7 +1623,6 @@ async fn validate_config(cli: &Cli) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instance::config_dir_startup::config_document_identity;
     use crate::proto::common::CompressionAlgoPb;
 
     /// Parses the flags the way the binary does.
@@ -1777,396 +1634,8 @@ mod tests {
         cli_from_matches(&cli_command().try_get_matches_from(argv)?)
     }
 
-    fn startup_fixture_config(id: uuid::Uuid) -> String {
-        format!(
-            "instance_id = '{id}'\nlisteners = []\nstun_servers = []\nstun_servers_v6 = []\ntcp_stun_servers = []\n[flags]\nno_tun = true\nbind_device = false\nenable_ipv6 = false\ndisable_upnp = true\n"
-        )
-    }
-
-    #[tokio::test]
-    async fn config_dir_startup_isolates_invalid_and_preserves_stopped_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().to_path_buf();
-        let invalid = uuid::Uuid::new_v4();
-        let stopped = uuid::Uuid::new_v4();
-        let active = uuid::Uuid::new_v4();
-        let removed = uuid::Uuid::new_v4();
-        let removed_enabled = uuid::Uuid::new_v4();
-        for id in [invalid, stopped, active] {
-            // A file that cannot be loaded is isolated from the others.
-            let raw = if id == invalid {
-                vec![0xff, 0xfe]
-            } else {
-                startup_fixture_config(id).into_bytes()
-            };
-            std::fs::write(directory.join(format!("{id}.toml")), raw).unwrap();
-        }
-        let state = InstanceStateStore::new(Some(&directory));
-        for id in [invalid, stopped, removed] {
-            state.set_enabled(id, false).unwrap();
-        }
-        state.set_enabled(removed_enabled, true).unwrap();
-        let mut startup = prepare_startup_configs(&[], Some(&directory), true)
-            .await
-            .unwrap();
-        assert_eq!(startup.directory.config_dir_file_count, 3);
-        assert_eq!(startup.files.len(), 2);
-        let manager = native_cli_instance_manager(false, 0)
-            .unwrap()
-            .with_config_path(Some(directory.clone()));
-        assert!(
-            !start_prepared_configs(
-                &mut startup,
-                &manager,
-                &state,
-                &NetworkOptions::default(),
-                false,
-            )
-            .unwrap()
-        );
-        assert!(manager.instance(active).is_some());
-        assert!(manager.instance(invalid).is_none());
-        assert!(manager.instance(stopped).is_none());
-        assert!(manager.managed_config_ids().contains(&stopped));
-        startup.reconcile_state(&state);
-        let reloaded = InstanceStateStore::new(Some(&directory));
-        assert_eq!(reloaded.enabled_state(&active), Some(true));
-        assert_eq!(reloaded.enabled_state(&removed_enabled), None);
-        assert!(!state.is_enabled(&invalid));
-        assert!(!state.is_enabled(&stopped));
-        assert_eq!(state.enabled_state(&removed), None);
-        manager.delete_network_instances([active]).await.unwrap();
-
-        // A malformed arbitrary filename cannot prove which old UUID it
-        // belonged to; retaining old state is safer than silently enabling it.
-        state.set_enabled(removed, false).unwrap();
-        std::fs::write(directory.join("unknown.toml"), "[flags\ninvalid").unwrap();
-        let startup = prepare_startup_configs(&[], Some(&directory), true)
-            .await
-            .unwrap();
-        assert!(startup.directory.unidentified_config_dir_entry);
-        startup.reconcile_state(&state);
-        assert!(!state.is_enabled(&removed));
-    }
-
-    #[tokio::test]
-    async fn config_dir_startup_skips_all_duplicate_owners_including_invalid_files() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().to_path_buf();
-        let mixed_duplicate = uuid::Uuid::new_v4();
-        let valid_duplicate = uuid::Uuid::new_v4();
-        let stopped = uuid::Uuid::new_v4();
-        for (name, id, invalid) in [
-            ("mixed-valid", mixed_duplicate, false),
-            ("mixed-invalid", mixed_duplicate, true),
-            ("valid-first", valid_duplicate, false),
-            ("valid-second", valid_duplicate, false),
-            ("stopped", stopped, false),
-        ] {
-            let mut raw = startup_fixture_config(id);
-            if invalid {
-                raw = raw.replace("no_tun = true", "no_tun = 'invalid'");
-            }
-            std::fs::write(directory.join(format!("{name}.toml")), raw).unwrap();
-        }
-        let state = InstanceStateStore::new(Some(&directory));
-        for id in [mixed_duplicate, valid_duplicate, stopped] {
-            state.set_enabled(id, false).unwrap();
-        }
-        let mut startup = prepare_startup_configs(&[], Some(&directory), true)
-            .await
-            .unwrap();
-        assert_eq!(startup.directory.config_dir_file_count, 5);
-        assert_eq!(startup.files.len(), 1);
-        assert_eq!(startup.files[0].config.get_id(), stopped);
-        let manager = native_cli_instance_manager(false, 0)
-            .unwrap()
-            .with_config_path(Some(directory));
-        start_prepared_configs(
-            &mut startup,
-            &manager,
-            &state,
-            &NetworkOptions::default(),
-            false,
-        )
-        .unwrap();
-        assert!(manager.instance_ids().is_empty());
-        assert_eq!(manager.managed_config_ids(), vec![stopped]);
-        startup.reconcile_state(&state);
-        for id in [mixed_duplicate, valid_duplicate, stopped] {
-            assert!(!state.is_enabled(&id));
-        }
-    }
-
-    #[tokio::test]
-    async fn config_dir_startup_keeps_valid_readonly_env_and_legacy_configs() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().to_path_buf();
-        let readonly_id = uuid::Uuid::new_v4();
-        let env_id = uuid::Uuid::new_v4();
-        let readonly_path = directory.join(format!("{readonly_id}.toml"));
-        let legacy_path = directory.join("legacy.toml");
-        std::fs::write(&readonly_path, startup_fixture_config(readonly_id)).unwrap();
-        std::fs::write(
-            directory.join(format!("{env_id}.toml")),
-            startup_fixture_config(env_id).replace(
-                "no_tun = true",
-                &format!("no_tun = ${{ET_STARTUP_TEST_{}:-true}}", env_id.simple()),
-            ),
-        )
-        .unwrap();
-        let legacy_raw = startup_fixture_config(uuid::Uuid::new_v4())
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&legacy_path, &legacy_raw).unwrap();
-        let original_permissions = [readonly_path.clone(), legacy_path.clone()].map(|path| {
-            (
-                path.clone(),
-                std::fs::metadata(&path).unwrap().permissions(),
-            )
-        });
-        for (path, original) in &original_permissions {
-            let mut permissions = original.clone();
-            permissions.set_readonly(true);
-            std::fs::set_permissions(path, permissions).unwrap();
-        }
-        let prepared = prepare_startup_configs(&[], Some(&directory), false).await;
-        for (path, original) in original_permissions {
-            std::fs::set_permissions(path, original).unwrap();
-        }
-        let mut startup = prepared.unwrap();
-        assert_eq!(startup.files.len(), 3);
-        assert!(startup.files.iter().all(|file| file.control.is_read_only()));
-        assert!(
-            startup
-                .files
-                .iter()
-                .all(|file| file.config.get_flags().no_tun)
-        );
-        let legacy = startup
-            .files
-            .iter()
-            .find(|file| file.path == legacy_path)
-            .unwrap();
-        assert!(config_document_identity(legacy.config.dump().as_bytes()).is_none());
-        assert!(startup.directory.unidentified_config_dir_entry);
-        let manager = native_cli_instance_manager(false, 0)
-            .unwrap()
-            .with_config_path(Some(directory));
-        start_prepared_configs(
-            &mut startup,
-            &manager,
-            &InstanceStateStore::in_memory(),
-            &NetworkOptions::default(),
-            false,
-        )
-        .unwrap();
-        assert_eq!(manager.instance_ids().len(), 3);
-        assert!(manager.instance(readonly_id).is_some());
-        assert!(manager.instance(env_id).is_some());
-        assert_eq!(std::fs::read_to_string(legacy_path).unwrap(), legacy_raw);
-        manager
-            .delete_network_instances(manager.instance_ids())
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn config_dir_startup_isolates_register_run_errors_and_keeps_explicit_fatal() {
-        let directory = tempfile::tempdir().unwrap();
-        let directory = directory.path().to_path_buf();
-        let explicit_invalid = directory.join("explicit-invalid.toml");
-        std::fs::write(&explicit_invalid, [0xff, 0xfe]).unwrap();
-        assert!(
-            prepare_startup_configs(
-                std::slice::from_ref(&explicit_invalid),
-                Some(&directory),
-                true
-            )
-            .await
-            .is_err()
-        );
-        std::fs::remove_file(explicit_invalid).unwrap();
-        let register_conflict = uuid::Uuid::new_v4();
-        let run_conflict = uuid::Uuid::new_v4();
-        let valid = uuid::Uuid::new_v4();
-        for id in [register_conflict, run_conflict, valid] {
-            std::fs::write(
-                directory.join(format!("{id}.toml")),
-                startup_fixture_config(id),
-            )
-            .unwrap();
-        }
-        let manager = native_cli_instance_manager(false, 0)
-            .unwrap()
-            .with_config_path(Some(directory.clone()));
-        manager
-            .register_managed_config(
-                register_conflict,
-                ConfigFileControl::new(Some(directory.join("old.toml")), Default::default()),
-            )
-            .unwrap();
-        // A pre-existing explicit/runtime instance has no directory control.
-        // Registering the directory candidate succeeds, but creation fails.
-        manager
-            .create(
-                TomlConfigLoader::new_from_str(&startup_fixture_config(run_conflict)).unwrap(),
-                (),
-            )
-            .unwrap();
-        let mut startup = prepare_startup_configs(&[], Some(&directory), true)
-            .await
-            .unwrap();
-        start_prepared_configs(
-            &mut startup,
-            &manager,
-            &InstanceStateStore::in_memory(),
-            &NetworkOptions::default(),
-            false,
-        )
-        .unwrap();
-        assert!(manager.instance(register_conflict).is_none());
-        assert!(manager.instance(run_conflict).is_some());
-        assert!(manager.instance(valid).is_some());
-        manager
-            .delete_network_instances(manager.instance_ids())
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn config_dir_is_enabled_by_default_and_can_be_overridden() {
-        let cli = parse_test_cli(["easytier-core"]).unwrap();
-        let expected = std::env::var_os("ET_CONFIG_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("config.d"));
-        assert_eq!(cli.config_dir, Some(expected));
-        let cli = parse_test_cli(["easytier-core", "--config-dir", "custom-configs"]).unwrap();
-        assert_eq!(cli.config_dir, Some(PathBuf::from("custom-configs")));
-    }
-
-    #[test]
-    fn config_server_accepts_single_comma_separated_and_repeated_values() {
-        let single =
-            parse_test_cli(["easytier-core", "-w", "udp://127.0.0.1:22020/single"]).unwrap();
-        assert_eq!(
-            single.config_server.unwrap(),
-            vec!["udp://127.0.0.1:22020/single"]
-        );
-
-        let comma_separated = parse_test_cli([
-            "easytier-core",
-            "-w",
-            "udp://127.0.0.1:22020/first,udp://127.0.0.1:22021/second",
-        ])
-        .unwrap();
-        assert_eq!(
-            comma_separated.config_server.unwrap(),
-            vec![
-                "udp://127.0.0.1:22020/first",
-                "udp://127.0.0.1:22021/second"
-            ]
-        );
-
-        let repeated = parse_test_cli([
-            "easytier-core",
-            "-w",
-            "udp://127.0.0.1:22020/first",
-            "-w",
-            "udp://127.0.0.1:22021/second",
-        ])
-        .unwrap();
-        assert_eq!(
-            repeated.config_server.unwrap(),
-            vec![
-                "udp://127.0.0.1:22020/first",
-                "udp://127.0.0.1:22021/second"
-            ]
-        );
-    }
-
-    #[test]
-    fn cli_preserves_native_state_dir_sni_and_transport_flag_presence() {
-        let cli = parse_test_cli([
-            "easytier-core",
-            "--state-dir",
-            "machine-state",
-            "--sni",
-            "front.example.com",
-            "--p2p-disguise-mode",
-            "only",
-            "--close-redundant-conns-when-disguised",
-            "--multi-thread",
-            "false",
-            "--multi-thread-count",
-            "7",
-        ])
-        .unwrap();
-        assert_eq!(cli.state_dir, Some(PathBuf::from("machine-state")));
-        assert_eq!(
-            cli.network_options.sni.as_deref(),
-            Some("front.example.com")
-        );
-        let patch = &cli.network_options.flags;
-        assert_eq!(patch.p2p_disguise_mode.as_deref(), Some("only"));
-        assert_eq!(patch.close_redundant_conns_when_disguised, Some(true));
-        assert_eq!(patch.multi_thread, Some(false));
-        assert_eq!(patch.multi_thread_count, Some(7));
-        assert_eq!(patch.disable_p2p, None);
-
-        let cfg = TomlConfigLoader::new_from_str(
-            r#"[flags]
-prefer_wss_http3_for_p2p = true
-disable_wss_http3_for_p2p = true
-disable_p2p = true
-"#,
-        )
-        .unwrap();
-        cli.network_options.merge_into(&cfg).unwrap();
-        assert_eq!(cfg.get_sni(), "front.example.com");
-        // The file's legacy booleans load as `disabled`; the CLI mode wins.
-        let merged = cfg.get_flags();
-        assert_eq!(
-            merged.p2p_disguise(),
-            easytier_proto::common::P2pDisguiseMode::Only
-        );
-        assert!(merged.close_redundant_conns_when_disguised);
-        assert!(merged.disable_p2p);
-        assert!(!merged.multi_thread);
-        assert_eq!(merged.multi_thread_count, 7);
-    }
-
-    #[test]
-    fn parallel_transport_cli_validates_and_can_reenable_preserved_count() {
-        let cli = Cli::try_parse_from([
-            "easytier-core",
-            "--parallel-connections",
-            "5",
-            "--disable-parallel-connections",
-            "--traffic-disguise",
-            "video",
-        ])
-        .unwrap();
-        let cfg = TomlConfigLoader::default();
-        cli.network_options.merge_into(&cfg).unwrap();
-        assert_eq!(cfg.get_parallel_connections(), 5);
-        assert!(cfg.get_disable_parallel_connections());
-        assert_eq!(cfg.get_traffic_disguise(), "video");
-        let cli =
-            Cli::try_parse_from(["easytier-core", "--disable-parallel-connections=false"]).unwrap();
-        cli.network_options.merge_into(&cfg).unwrap();
-        assert_eq!(cfg.get_parallel_connections(), 5);
-        assert!(!cfg.get_disable_parallel_connections());
-        for args in [
-            vec!["easytier-core", "--parallel-connections", "0"],
-            vec!["easytier-core", "--parallel-connections", "17"],
-            vec!["easytier-core", "--traffic-disguise", "invalid"],
-        ] {
-            assert!(Cli::try_parse_from(args).is_err());
-        }
-    }
+    #[cfg(test)]
+    mod custom_tests;
 
     #[test]
     fn shared_runtime_is_process_only_and_reuses_thread_count() {
@@ -2436,15 +1905,6 @@ enabled = true
     }
 
     #[test]
-    fn test_cli_disguise_policy_is_validated_before_merging() {
-        for mode in ["prefer", "off", "disabled", "only"] {
-            let patch = parse_flags(&["easytier", "--p2p-disguise-mode", mode]).unwrap();
-            assert_eq!(patch.p2p_disguise_mode.as_deref(), Some(mode));
-        }
-        assert!(parse_flags(&["easytier", "--p2p-disguise-mode", "disable"]).is_err());
-    }
-
-    #[test]
     fn test_cli_flags_from_schema_preserves_presence() {
         assert_eq!(parse_flags(&["easytier"]).unwrap(), FlagsPatch::default());
         let patch = parse_flags(&[
@@ -2460,6 +1920,9 @@ enabled = true
             "--socket-mark",
             "42",
             "--disable-relay-data",
+            "--enable-udp-fec",
+            "--enable-udp-fec-kcp",
+            "--enable-udp-fec-quic",
         ])
         .unwrap();
         assert_eq!(patch.enable_encryption, Some(true));
@@ -2471,7 +1934,24 @@ enabled = true
         );
         assert_eq!(patch.socket_mark, Some(42));
         assert_eq!(patch.disable_relay_data, Some(true));
+        assert_eq!(patch.enable_udp_fec, Some(true));
+        assert_eq!(patch.enable_udp_fec_kcp, Some(true));
+        assert_eq!(patch.enable_udp_fec_quic, Some(true));
         assert_eq!(patch.enable_ipv6, None);
+
+        let patch = parse_flags(&[
+            "easytier",
+            "--enable-udp-fec",
+            "false",
+            "--enable-udp-fec-kcp",
+            "false",
+            "--enable-udp-fec-quic",
+            "false",
+        ])
+        .unwrap();
+        assert_eq!(patch.enable_udp_fec, Some(false));
+        assert_eq!(patch.enable_udp_fec_kcp, Some(false));
+        assert_eq!(patch.enable_udp_fec_quic, Some(false));
 
         // A negated flag can be given bare, and bare means the value it states.
         let patch = parse_flags(&["easytier", "--disable-ipv6"]).unwrap();
@@ -2552,6 +2032,26 @@ enabled = true
 
         // Deprecated flag is not accepted.
         assert!(parse_flags(&["easytier", "--quic-listen-port", "1234"]).is_err());
+        assert!(
+            !cli_command()
+                .render_help()
+                .to_string()
+                .contains("tld-dns-zone")
+        );
+        assert!(
+            !cli_command()
+                .render_long_help()
+                .to_string()
+                .contains("tld-dns-zone")
+        );
+        let legacy_cli =
+            Cli::try_parse_from(["easytier-core", "--tld-dns-zone", "custom.local."]).unwrap();
+        let cfg = TomlConfigLoader::default();
+        legacy_cli.network_options.merge_into(&cfg).unwrap();
+        #[allow(deprecated)]
+        {
+            assert_eq!(cfg.get_flags().tld_dns_zone, "custom.local.");
+        }
 
         // MTU tests: u16 range validation
         let patch = parse_flags(&["easytier", "--mtu", "1400"]).unwrap();
