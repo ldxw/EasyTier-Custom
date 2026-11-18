@@ -1,8 +1,9 @@
 name: EasyTier CI
 
+# 本库用途是出 Docker 镜像 + 运行文件，日常推送不跑全量 CI（13 个 job，
+# 含网络集成测试 / Android NDK / 三平台编译，改 .env.example 也会全量跑）。
+# 只保留 PR 与手动触发：真改了 Rust/前端代码时开 PR 或来 Actions 页手动跑。
 on:
-  push:
-    branches: [main, develop]
   pull_request:
     branches: [main, develop]
     types: [opened, synchronize, reopened, ready_for_review]
