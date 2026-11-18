@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: '运行 id：本库 docker-artifacts.yml 的构建运行（提供 5 个架构的二进制 artifact）'
+        description: '运行 id：产出 5 个架构二进制 artifact 的那次构建（docker-artifacts.yml 或 docker-artifacts-all.yml 都行；artifact 名字是 easytier-linux-<arch>）'
         type: number
         required: true
       image_tag:
@@ -116,12 +116,15 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
+      # 只给 run_id，不给 workflow：dawidd6/action-download-artifact@v11 在有
+      # run_id 时直接按 run_id 拉 artifact（listWorkflowRunArtifacts），workflow
+      # 输入不参与过滤，只用来打印一行日志。写死 workflow 名反而会在填
+      # docker-artifacts-all.yml 的 run_id 时与实际来源不符。
       - name: Download artifact
         id: download-artifact
         uses: dawidd6/action-download-artifact@v11
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          workflow: docker-artifacts.yml
           run_id: ${{ inputs.run_id }}
           repo: ${{ github.repository }}
           path: docker_context

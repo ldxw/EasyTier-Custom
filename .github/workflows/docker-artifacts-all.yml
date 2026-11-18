@@ -1,0 +1,528 @@
+name: EasyTier Docker Artifacts (all-in-one)
+
+# 全套产物工作流：除了 core/cli，还构建 web（含前端 embed），
+# 让镜像里同时具备 easytier-core / easytier-cli / easytier-web-embed。
+#
+# 与 docker-artifacts.yml 的关系：
+#   docker-artifacts.yml       → 只出 core/cli，镜像里没有 web
+#   docker-artifacts-all.yml   → 本文件，出 core/cli/web-embed，并直接构建推镜像
+#
+# 为什么本文件自带镜像构建步骤：
+#   docker-custom.yml 的下载动作写死了 workflow: docker-artifacts.yml，
+#   拿不到本工作流上传的 artifact；改那个文件超出本次范围，
+#   所以镜像构建直接放在本文件内，两条路径互不影响。
+#
+# 两条出镜像的路径（build_image 开关二选一）：
+#   1) build_image=true（默认）：本文件的 docker job 直接构建并推镜像，
+#      一次运行产出 artifact + 镜像。
+#   2) build_image=false：只产出 artifact，不推镜像。之后用
+#      docker-custom.yml 把这次的 run_id 填进它的 run_id 输入即可出镜像
+#      （dawidd6/action-download-artifact@v11 给定 run_id 时直接按 run_id
+#      拉 artifact，不校验 workflow 名，所以它能取到本工作流的 artifact）。
+#      两条路径产出的是同一份镜像，重复用会白构建一次。
+#
+# 推送按钮的联动：
+#   build_image 是总闸。build_image=false 时，下面三个推送按钮
+#   （push_ghcr / push_dockerhub / push_acr）一律不生效——不管勾没勾，
+#   都不会推任何镜像。
+#   build_image=true 但三个推送目标一个都没勾，直接报错失败（不会白构建一遍）。
+#
+# 阿里云 ACR 的 attestation 处理：
+#   ACR 不认 application/vnd.oci.empty.v1+json 这类 attestation manifest，
+#   会以 "unknown manifest class" 拒绝整个 push。
+#   本文件的做法是：GHCR / Docker Hub 保留 buildx 的 provenance + SBOM；
+#   推 ACR 时从已推好的 index 里挑出 5 个真实平台条目，拼成一个不含
+#   attestation 的干净 index 再推（不二次构建）。
+#   跨仓库拷贝在部分 ACR 区域不支持 blob mount 时会失败，所以那一步允许失败，
+#   由 fallback 步骤接手——退回「构建期就关掉 attestation」的直接构建。
+#
+# 产物形态与上游 EasyTier/EasyTier 的 Core Action 一致：artifact 名就是目录名，
+# 内容是无包装的裸文件，下载后直接构成 docker 构建上下文：
+#   easytier-linux-{x86_64,armhf,armv7hf,aarch64,riscv64}/
+#     {easytier-core,easytier-cli,easytier-web-embed}
+# Dockerfile 按 TARGETPLATFORM 取目录，通配符 cp 会把三个二进制全装进镜像。
+#
+# alpine 运行时是 musl，所以必须编 *-musl 目标；gnu 产物放进去跑不起来。
+# allocator 与上游 core.yml 一致：aarch64/riscv64 用 mimalloc，其余用 jemalloc
+# （jemalloc 的 C 源在 arm/riscv64 上交叉编译不可靠）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_image:
+        description: '是否在本工作流内构建并推送镜像（false = 只产出 artifact，下面三个推送按钮都不生效，镜像改用 docker-custom.yml 构建）'
+        type: boolean
+        default: true
+        required: true
+      image_tag:
+        description: '镜像 tag（不带 registry 前缀）'
+        type: string
+        default: 'dev'
+        required: true
+      mark_latest:
+        description: '同时打 latest 标签'
+        type: boolean
+        default: false
+        required: true
+      mark_unstable:
+        description: '同时打 unstable 标签'
+        type: boolean
+        default: false
+        required: true
+      push_ghcr:
+        description: '推送到 GHCR（需先启用 build_image）'
+        type: boolean
+        default: true
+        required: true
+      push_dockerhub:
+        description: '推送到 Docker Hub（需先启用 build_image）'
+        type: boolean
+        default: false
+        required: true
+      push_acr:
+        description: '推送到阿里云 ACR（需先启用 build_image；ACR 不认 attestation manifest，会自动剥离后再推）'
+        type: boolean
+        default: true
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # 前端只编一次：embed 版的 web 二进制要把 easytier-web/frontend/dist
+  # 整个打进二进制，五个架构各编一次前端纯属浪费。
+  frontend:
+    name: Shared production frontend assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/prepare-build
+        with:
+          target: wasm32-unknown-unknown
+          pnpm: true
+          token: ${{ github.token }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: frontend-wasm
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: pnpm build:frontend:ci
+      - name: Package shared resources
+        run: |
+          mkdir -p easytier-web/frontend/dist/config-generator
+          cp -R easytier-web/config-generator/dist/. easytier-web/frontend/dist/config-generator/
+          test -s easytier-web/frontend/dist/index.html
+          test -s easytier-web/frontend/dist/config-generator/index.html
+          test -s easytier-gui/dist/index.html
+          tar -czf frontend-assets.tar.gz easytier-web/frontend/dist easytier-web/frontend-lib/dist easytier-gui/dist
+      - uses: ./.github/actions/shared-resources
+        with:
+          mode: save
+          name: frontend
+          path: frontend-assets.tar.gz
+
+  artifacts:
+    name: Linux (${{ matrix.arch }})
+    needs: [frontend]
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            features: jemalloc
+          - target: arm-unknown-linux-musleabihf
+            arch: armhf
+            features: jemalloc
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7hf
+            features: jemalloc
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            features: mimalloc
+          - target: riscv64gc-unknown-linux-musl
+            arch: riscv64
+            features: mimalloc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # git_version! 在编译期调用 git describe。没有 exact tag 时打一个本地
+      # annotated tag，让二进制 --version 落到 *-custom-dev，而不是一串 sha。
+      # 只在工作区生效，不推送。
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "Building for tag ${GITHUB_REF_NAME}"
+          elif git describe --tags --exact-match >/dev/null 2>&1; then
+            echo "Building at exact tag $(git describe --tags --exact-match)"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                tag -f -a dev -m "dev build" HEAD
+            echo "No exact tag; tagged HEAD as dev"
+          fi
+          echo "git describe: $(git describe --tags --abbrev=8 --always --dirty=~)"
+
+      # 与 build.yml 的 core job 用同一套环境准备（build-essential/mold/musl-tools、
+      # protoc 35.1、Rust 1.95），避免版本漂移。
+      - uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ matrix.target }}
+          token: ${{ github.token }}
+
+      # 保险起见装上 cmake/ninja：当前依赖链（sqlx sqlite bundled、reqwest
+      # rustls-no-provider、quinn rustls-ring）不编译 aws-lc-sys，理论上用不到，
+      # 但一旦某个传递依赖改用 cmake 构建，少这一步会在链接阶段才炸。
+      - name: Install cmake toolchain (insurance)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qqy cmake ninja-build
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: true
+
+      # 上游 build.yml 锁 0.23.2；0.24.0 在 arm musl 目标的链接阶段会失败。
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.23.2
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: docker-artifacts-all-${{ matrix.target }}
+
+      # embed 版的 web 需要 easytier-web/frontend/dist 存在，RustEmbed 在编译期
+      # 把它整个打进二进制。前端由 frontend job 产出，这里取出来。
+      - uses: ./.github/actions/shared-resources
+        with:
+          mode: restore
+          name: frontend
+          path: frontend-assets.tar.gz
+      - name: Extract frontend assets
+        run: |
+          set -euo pipefail
+          tar -xzf frontend-assets.tar.gz
+          test -s easytier-web/frontend/dist/index.html
+
+      - name: Build binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+
+          cargo zigbuild --locked --release --target "$TARGET" -p easytier \
+            --features "$FEATURES" --bin easytier-core --bin easytier-cli
+
+          # web：embed feature 把前端资源和 resources/ 下的 mmdb、字体打进二进制。
+          # easytier-web crate 没有 [[bin]] 段，产物名就是 easytier-web。
+          cargo zigbuild --locked --release --target "$TARGET" -p easytier-web \
+            --features embed
+
+          mkdir -p "easytier-linux-${ARCH}"
+          cp "target/${TARGET}/release/easytier-core" \
+             "target/${TARGET}/release/easytier-cli" \
+             "easytier-linux-${ARCH}/"
+          # 与本库 build-core.sh、上游 core.yml 一致：镜像里只放改名后的
+          # easytier-web-embed，不再保留独立的 easytier-web。
+          cp "target/${TARGET}/release/easytier-web" \
+             "easytier-linux-${ARCH}/easytier-web-embed"
+          chmod 755 easytier-linux-"${ARCH}"/*
+          file easytier-linux-"${ARCH}"/easytier-core
+          file easytier-linux-"${ARCH}"/easytier-web-embed
+          ls -l easytier-linux-"${ARCH}"
+
+      # 上传的是目录里的内容而不是目录本身：artifact 名会成为下载后的目录名，
+      # 于是得到 docker_context/easytier-linux-<arch>/{三个二进制}，
+      # 与 .github/workflows/Dockerfile 里的 cp 路径一一对应。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: easytier-linux-${{ matrix.arch }}
+          path: easytier-linux-${{ matrix.arch }}/*
+          retention-days: 7
+          if-no-files-found: error
+
+  docker:
+    name: Build and push image
+    needs: [artifacts]
+    # build_image=false 时（仅 workflow_dispatch 可设）整块跳过，只留 artifact。
+    # push 标签事件没有 inputs，一律构建镜像。
+    if: github.actor == github.repository_owner && (github.event_name != 'workflow_dispatch' || inputs.build_image == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # 归一化后的开关。workflow_dispatch 时取用户勾选值；push 标签事件时
+    # inputs 全是 null，需要给出默认值，否则下面的校验会把这次运行判失败。
+    # BUILD_IMAGE 是推送开关的总闸：没启用构建镜像时，三个推送目标一律视为 false。
+    env:
+      BUILD_IMAGE: ${{ inputs.build_image != false || github.event_name != 'workflow_dispatch' }}
+      IMAGE_TAG: ${{ inputs.image_tag || github.ref_name }}
+      MARK_LATEST: ${{ inputs.mark_latest == true }}
+      MARK_UNSTABLE: ${{ inputs.mark_unstable == true }}
+      PUSH_GHCR: ${{ (inputs.push_ghcr != false || github.event_name != 'workflow_dispatch') && (inputs.build_image != false || github.event_name != 'workflow_dispatch') }}
+      PUSH_DOCKERHUB: ${{ inputs.push_dockerhub == true && (inputs.build_image != false || github.event_name != 'workflow_dispatch') }}
+      PUSH_ACR: ${{ inputs.push_acr == true && (inputs.build_image != false || github.event_name != 'workflow_dispatch') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Validate inputs
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          if [[ "$MARK_LATEST" == "true" && "$MARK_UNSTABLE" == "true" ]]; then
+            echo "::error::mark_latest 和 mark_unstable 不能同时为 true"
+            exit 1
+          fi
+          if [[ "$PUSH_GHCR" != "true" && "$PUSH_DOCKERHUB" != "true" && "$PUSH_ACR" != "true" ]]; then
+            if [[ "$BUILD_IMAGE" == "true" ]]; then
+              echo "::error::已启用 build_image，但三个推送目标一个都没勾选；请至少勾选一个（GHCR / Docker Hub / 阿里云 ACR）"
+            else
+              echo "::error::build_image 未启用时推送目标不生效，本次运行只产出 artifact"
+            fi
+            exit 1
+          fi
+          if [[ "$PUSH_DOCKERHUB" == "true" ]]; then
+            if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+              echo "::error::推送 Docker Hub 需要 secrets.DOCKERHUB_USERNAME 和 secrets.DOCKERHUB_TOKEN"
+              exit 1
+            fi
+          fi
+          if [[ "$PUSH_ACR" == "true" ]]; then
+            if [[ -z "$ACR_REGISTRY" || -z "$ACR_USERNAME" || -z "$ACR_PASSWORD" || -z "$ACR_NAMESPACE" ]]; then
+              echo "::error::推送阿里云 ACR 需要 secrets.ACR_REGISTRY / ACR_USERNAME / ACR_PASSWORD / ACR_NAMESPACE"
+              exit 1
+            fi
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: ${{ env.PUSH_GHCR == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: ${{ env.PUSH_DOCKERHUB == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to Aliyun ACR
+        if: ${{ env.PUSH_ACR == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # 取本次运行上传的 5 个 artifact。merge-multiple: false 时每个 artifact
+      # 落在自己的子目录里，正好对上 Dockerfile 的 easytier-linux-<arch> 路径。
+      - name: Download artifacts from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: easytier-linux-*
+          path: docker_context
+          merge-multiple: false
+
+      - name: List files
+        run: |
+          ls -l -R docker_context
+
+      - name: Prepare Docker tags
+        id: tags
+        env:
+          # 开关与 tag 已在 job 级 env 归一化，这里只补 secrets
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+        run: |
+          set -euo pipefail
+
+          # 单个镜像的标签串：基础 tag + 可选的 latest / unstable
+          image_tags() {
+            local image="$1"
+            local out="${image}:${IMAGE_TAG}"
+            if [[ "$MARK_LATEST" == "true" ]]; then
+              out="${out},${image}:latest"
+            fi
+            if [[ "$MARK_UNSTABLE" == "true" ]]; then
+              out="${out},${image}:unstable"
+            fi
+            printf '%s' "$out"
+          }
+
+          # 把若干标签段拼成 build-push-action 需要的逗号列表
+          join_tags() {
+            local sep="" t
+            for t in "$@"; do
+              [[ -z "$t" ]] && continue
+              printf '%s%s' "$sep" "$t"
+              sep=","
+            done
+          }
+
+          attested=()
+          ghcr_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/easytier-custom"
+          hub_image="${DOCKERHUB_USERNAME,,}/easytier-custom"
+          acr_image="${ACR_REGISTRY}/${ACR_NAMESPACE}/easytier-custom"
+
+          # mirror_repo 是"已带 attestation 的那份镜像"所在仓库，供 ACR 拷贝时读取
+          mirror_repo=""
+          if [[ "$PUSH_GHCR" == "true" ]]; then
+            attested+=("$(image_tags "$ghcr_image")")
+            mirror_repo="$ghcr_image"
+          fi
+          if [[ "$PUSH_DOCKERHUB" == "true" ]]; then
+            attested+=("$(image_tags "$hub_image")")
+            if [[ -z "$mirror_repo" ]]; then
+              mirror_repo="$hub_image"
+            fi
+          fi
+
+          ACR_TAGS=""
+          if [[ "$PUSH_ACR" == "true" ]]; then
+            ACR_TAGS="$(image_tags "$acr_image")"
+          fi
+
+          echo "attested_tags=$(join_tags ${attested[@]+"${attested[@]}"})" >> "$GITHUB_OUTPUT"
+          echo "acr_tags=${ACR_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "mirror_repo=${mirror_repo}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "GHCR / Docker Hub tags: $(join_tags ${attested[@]+"${attested[@]}"})"
+          echo "Aliyun ACR tags: ${ACR_TAGS:-<none>}"
+          echo "ACR mirror source: ${mirror_repo:-<none>}"
+
+      # 一次构建产物：GHCR / Docker Hub 认识 OCI attestation manifest，
+      # 保留 buildx 默认的 provenance + SBOM，镜像附带来源证明
+      - name: Build and push (GHCR / Docker Hub)
+        if: ${{ env.PUSH_GHCR == 'true' || env.PUSH_DOCKERHUB == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker_context
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+          push: true
+          provenance: true
+          sbom: true
+          file: .github/workflows/Dockerfile
+          tags: ${{ steps.tags.outputs.attested_tags }}
+
+      # 只勾了阿里云时没有可镜像的源，直接构建并在构建阶段就关掉 attestation
+      - name: Build and push (Aliyun ACR only)
+        if: ${{ env.PUSH_ACR == 'true' && env.PUSH_GHCR != 'true' && env.PUSH_DOCKERHUB != 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker_context
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+          push: true
+          provenance: false
+          sbom: false
+          file: .github/workflows/Dockerfile
+          tags: ${{ steps.tags.outputs.acr_tags }}
+
+      # 阿里云 ACR 不认 application/vnd.oci.empty.v1+json 这类 attestation manifest，
+      # 会以 "unknown manifest class" 拒绝整个 push。这里不重建镜像，
+      # 而是从已推好的 index 里挑出 5 个真实平台条目，拼成一个不含 attestation 的
+      # 干净 index 推到 ACR——层数据由 buildx 从源仓库直接复制，不经过二次构建。
+      #
+      # 跨仓库拷贝在部分 ACR 区域不支持 blob mount 时会失败，所以这里允许失败，
+      # 由下面的 fallback 步骤接手（退回构建期就关掉 attestation 的直接构建）。
+      - name: Mirror to Aliyun ACR (strip attestation)
+        id: mirror-acr
+        continue-on-error: true
+        if: ${{ env.PUSH_ACR == 'true' && (env.PUSH_GHCR == 'true' || env.PUSH_DOCKERHUB == 'true') }}
+        env:
+          MIRROR_REPO: ${{ steps.tags.outputs.mirror_repo }}
+          IMAGE_TAG: ${{ steps.tags.outputs.image_tag }}
+          ACR_TAGS: ${{ steps.tags.outputs.acr_tags }}
+        run: |
+          set -euo pipefail
+
+          source_ref="${MIRROR_REPO}:${IMAGE_TAG}"
+          echo "镜像源: ${source_ref}"
+
+          # 只取真实平台条目，丢掉 unknown/unknown 的 attestation manifest。
+          # 三个条件都要满足：platform.os 是 linux、architecture 不是 unknown、
+          # 且没有 attestation 标记（attestation manifest 的 annotations 里有
+          # vnd.docker.reference.type=attestation-manifest）。
+          raw="$(docker buildx imagetools inspect --raw "$source_ref")"
+          mapfile -t digests < <(
+            printf '%s' "$raw" \
+              | python3 -c 'import json,sys;idx=json.load(sys.stdin);print("\n".join(m["digest"] for m in idx.get("manifests",[]) if (m.get("platform") or {}).get("os")=="linux" and (m.get("platform") or {}).get("architecture") not in (None,"","unknown") and (m.get("annotations") or {}).get("vnd.docker.reference.type")!="attestation-manifest"))' \
+              | grep -v '^$' || true
+          )
+
+          if [[ "${#digests[@]}" -ne 5 ]]; then
+            echo "::error::从 ${source_ref} 只筛出 ${#digests[@]} 个平台条目，预期 5 个"
+            printf '%s\n' "$raw"
+            exit 1
+          fi
+
+          for d in "${digests[@]}"; do
+            echo "  平台条目 ${d}"
+          done
+
+          sources=()
+          for d in "${digests[@]}"; do
+            sources+=("${MIRROR_REPO}@${d}")
+          done
+
+          tag_args=()
+          IFS=',' read -ra tag_list <<< "$ACR_TAGS"
+          for t in "${tag_list[@]}"; do
+            tag_args+=(-t "$t")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          echo "已推送到阿里云 ACR：${ACR_TAGS}"
+
+      # 兜底：上面的跨仓库拷贝失败时，直接在构建阶段就关掉 attestation 重新推一次。
+      # 这样 ACR 拿到的 index 里只有 5 个真实平台条目，不含 attestation manifest。
+      - name: Build and push to Aliyun ACR (no attestation, fallback)
+        if: ${{ env.PUSH_ACR == 'true' && (env.PUSH_GHCR == 'true' || env.PUSH_DOCKERHUB == 'true') && steps.mirror-acr.outcome == 'failure' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker_context
+          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
+          push: true
+          provenance: false
+          sbom: false
+          file: .github/workflows/Dockerfile
+          tags: ${{ steps.tags.outputs.acr_tags }}

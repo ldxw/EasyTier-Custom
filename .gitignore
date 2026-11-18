@@ -65,3 +65,7 @@ easytier-gui/src-tauri/*.sys
 .zcode/
 .test-env/
 .pnpm-store/
+
+# 本地运行配置（含网络密钥）
+.env
+!.env.example
