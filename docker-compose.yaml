@@ -1,0 +1,282 @@
+# EasyTier 自定义镜像 运行文件（core / cli / web-embed 全套）
+#
+# 服务：
+#   easytier-web       本库镜像 ghcr.io/ldxw/easytier-custom，跑 easytier-web-embed，
+#                      提供 Web 面板 / REST API / config-server
+#   easytier           同一个本库镜像，跑 easytier-core，接 web 的 config-server
+#   easytier-standalone 本库镜像，不接 web 的单节点模式（docker compose --profile standalone up -d）
+#
+# 用法：
+#   1. cp .env.example .env   并填好 ET_WEB_USER / ET_NETWORK_SECRET 等
+#   2. docker login ghcr.io    （本库镜像包是私有的，密码用 GitHub PAT，勾 read:packages）
+#   3. docker compose up -d
+#
+# ── 这个文件为什么这样写（都是本仓库的实际情况，不是笔误）──────────────────
+#
+# 1) web 服务必须用本库镜像，不能用官方镜像。
+#    本库 core 实现了 PersistedConfigService（easytier-core/src/management/full/
+#    persisted_rpc.rs），提供 ObserveConfigs / PatchPersistedConfig RPC，直接读写
+#    config.d 里的 TOML，并通过心跳上报 management:persisted-config-revision-v2
+#    capability。本库 web（easytier-web/src/client_manager/session/local_configs.rs）
+#    依赖这套 RPC 才能工作，REST 入口是 /api/v1/machines/{machine}/local-configs。
+#    官方 v2.7.1 的 web 不认这套，走的是「数据库下发配置」那条路，与本库 core
+#    语义错配：core 报 support_local_configs=true 时官方 web 会跳过 DB reconcile，
+#    面板里改了配置却落不下去。
+#    → web 与 core 必须是同一套本库镜像。
+#
+# 2) web 后台改配置是能落到 core 的，但落点是 core 的本地 TOML 文件。
+#    本库 core 的 --config-dir 带 default_value = "config.d"，所以
+#    easytier/src/web_client/mod.rs 里 support_local_configs 恒为 true。
+#    这个标志的语义是「core 自己管本地配置目录」，不是「core 不接受 web 配置」。
+#    web 一旦看到它，就绕开数据库下发，改走本地目录路径：
+#      easytier-web/src/client_manager/mod.rs:376/427 与 session/runtime_revision.rs:92
+#        → 命中标志后跳过 DB reconcile
+#      easytier-core/src/management/full/remote_client.rs:206
+#        → mutation_guard.rs:98 run_network_instance_for_local_config_impl
+#        → 直接调 core 的 run_network_instance RPC
+#      easytier-core/src/management/full/process_rpc.rs:483
+#        → 落成 config.d/{instance_id}.toml
+#    实际效果：web 面板能看到设备、在线状态、peer、流量；后台改网络配置会写进
+#    core 的 config.d 目录并即时生效。core 侧的权威始终是那些 TOML 文件，
+#    本地手改同样有效。
+#
+# 3) 官网示例的 ET_DATA_DIR / ET_CONF_DIR 在本版不存在。
+#    对应关系：ET_DATA_DIR → ET_STATE_DIR（machine id 落盘处），
+#              ET_CONF_DIR  → ET_CONFIG_DIR（实例配置目录）。
+#
+# 4) core 不挂 /etc/machine-id。
+#    本版 easytier/src/common/machine_id.rs 从不读 /etc/machine-id，
+#    只用 ET_STATE_DIR/machine_id（没有则回落 XDG_DATA_HOME）。
+#    所以 ET_STATE_DIR 必须是持久卷，否则容器重建后身份漂移。
+#
+# 5) --config-server 的 URL 最后一段是 token，core 拿它当用户名去 web 认证。
+#    web 侧首次接入必须开自动建号（下面 ET_ALLOW_AUTO_CREATE_USER=true），
+#    否则 db 里没有对应用户，core 认不出来。
+#
+# 6) 默认不配任何 OIDC 变量。
+#    OIDC 的 issuer / client_id / redirect_url / frontend_base_url 没有 env 支持，
+#    只能用命令行传；一旦传了其中的任意一个，web 会走 split-deploy 强制校验并退出。
+#    需要 OIDC 请自己在 web 服务的 command 里补 --oidc-* 参数。
+#
+# 7) RPC 管理口只映射到宿主机 127.0.0.1。
+#    ET_RPC_PORTAL_WHITELIST 默认全放行，是因为程序默认白名单只有回环，
+#    而容器里看到的是网桥网关地址（172.17.0.1），宿主机用 easytier-cli 连会被拒。
+#    安全性靠端口只绑 127.0.0.1；要在局域网管理就改这里并把白名单收紧。
+#
+# 8) web 容器覆盖了 healthcheck，探的是 /api/v1/auth/logout。
+#    两层原因：
+#    a) 镜像自带的 HEALTHCHECK 跑的是 easytier-cli --rpc-portal 127.0.0.1:15888，
+#       那是 core 的管理口；web 容器没有 RPC portal，用原样会一直 unhealthy。
+#    b) 换成 API 端点时不能探 /api/v1/console-info 或 /api/v1/summary——
+#       它俩在 login_required! 层下面，未登录时返回 401，wget 退出码 1，
+#       容器还是 unhealthy。logout 是免认证 GET，未登录返回 200 + {}。
+#
+# 9) web 容器不要 NET_ADMIN / /dev/net/tun。
+#    那些是 core 建虚拟网卡用的；web 只做配置与状态中转。
+
+x-core-common: &core-common
+  image: ghcr.io/${ET_IMAGE_OWNER:-ldxw}/easytier-custom:${ET_IMAGE_TAG:-dev}
+  restart: unless-stopped
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun:/dev/net/tun
+  sysctls:
+    # EasyTier 走用户态协议栈，内核转发不是必需项；
+    # 打开只是让容器内网与宿主其他容器/网段互通更顺
+    net.ipv4.ip_forward: "1"
+
+services:
+  easytier-web:
+    # 与 core 同一个本库镜像（镜像里含 easytier-core / easytier-cli /
+    # easytier-web-embed 三个二进制），web 和 core 必须配套，见文件头第 1 条。
+    image: ghcr.io/${ET_IMAGE_OWNER:-ldxw}/easytier-custom:${ET_IMAGE_TAG:-dev}
+    container_name: easytier-web
+    restart: unless-stopped
+    # 镜像 ENTRYPOINT 是 easytier-core，这里换成 web 服务
+    entrypoint:
+      - /sbin/tini
+      - --
+      - easytier-web-embed
+    # 镜像自带 HEALTHCHECK 是给 core 用的（探 RPC portal），web 没有 RPC
+    # portal，必须覆盖，否则容器永远 unhealthy。见文件头第 8 条。
+    #
+    # 探 /api/v1/auth/logout 而不是 /api/v1/console-info：
+    # console-info 和 summary 都在 login_required! 层下面，未登录时返回 401，
+    # wget 会以退出码 1 失败 → 容器永远 unhealthy。
+    # logout 是免认证的 GET，未登录时返回 200 + {}，无副作用。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:${ET_API_SERVER_PORT:-11211}/api/v1/auth/logout"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    environment:
+      # --- 数据库：设备、用户、实例配置都落在这里，必须持久化 ---
+      - ET_WEB_DB=${ET_WEB_DB:-/app/et.db}
+
+      # --- REST API + 前端 ---
+      # 不传 ET_WEB_SERVER_PORT 时，前端页面与 REST API 共用 11211 一个端口。
+      # 要前端单独占一个端口，设 ET_WEB_SERVER_PORT，并把 ET_API_HOST 指向 API 端口。
+      - ET_API_SERVER_PORT=${ET_API_SERVER_PORT:-11211}
+      - ET_API_SERVER_ADDR=${ET_API_SERVER_ADDR:-0.0.0.0}
+      # 前端独立端口（可选，默认留空 = 与 API 同端口）
+      # - ET_WEB_SERVER_PORT
+      # - ET_API_HOST
+
+      # --- config-server：core 通过它注册、取配置 ---
+      - ET_CONFIG_SERVER_PORT=${ET_CONFIG_SERVER_PORT:-22020}
+      - ET_CONFIG_SERVER_PROTOCOL=${ET_CONFIG_SERVER_PROTOCOL:-udp}
+      # 监听地址。本库 web 用 ET_CONFIG_SERVER_LISTENERS（逗号分隔），
+      # 没有 ET_CONFIG_SERVER_HOST 这个变量。
+
+      # --- 接入策略 ---
+      # 允许用 token 自动建号：ET_WEB_USER 就是 token，也是用户名
+      - ET_ALLOW_AUTO_CREATE_USER=${ET_ALLOW_AUTO_CREATE_USER:-true}
+      # 关闭注册页面（只允许已存在的账号登录）
+      - ET_DISABLE_REGISTRATION=${ET_DISABLE_REGISTRATION:-true}
+
+      # --- 日志 ---
+      - ET_WEB_CONSOLE_LOG_LEVEL=${ET_WEB_CONSOLE_LOG_LEVEL:-info}
+      - ET_WEB_FILE_LOG_LEVEL=${ET_WEB_FILE_LOG_LEVEL:-info}
+      - ET_WEB_FILE_LOG_DIR=${ET_WEB_FILE_LOG_DIR:-/app/logs}
+
+      # --- webhook / OIDC：不配就不启用 ---
+      # - ET_WEBHOOK_URL
+      # - ET_WEBHOOK_SECRET
+      # - ET_INTERNAL_AUTH_TOKEN
+
+    ports:
+      # REST API + Web 面板
+      - "${ET_WEB_API_PORT:-11211}:${ET_API_SERVER_PORT:-11211}/tcp"
+      # config-server，core 接入用；外部 core 也能连
+      - "${ET_CONFIG_SERVER_PORT:-22020}:${ET_CONFIG_SERVER_PORT:-22020}/udp"
+
+    volumes:
+      # db + 文件日志
+      - easytier-web-data:/app
+
+  easytier:
+    <<: *core-common
+    container_name: easytier
+    environment:
+      # --- 接入 web 的 config-server ---
+      # URL 最后一段是 token，core 拿它当用户名去 web 认证
+      - ET_CONFIG_SERVER=${ET_WEB_PROTOCOL:-udp}://easytier-web:${ET_CONFIG_SERVER_PORT:-22020}/${ET_WEB_USER:-admin}
+      # 要完全手写就设 ET_CONFIG_SERVER（会整体覆盖上面这行拼出来的值）：
+      # ET_CONFIG_SERVER=tcp://web.example.com:22020/my-token
+
+      # --- RPC 管理口（镜像自带 HEALTHCHECK 走 127.0.0.1:15888）---
+      # 不设 ET_RPC_PORTAL 就没有 rpc portal，core 起不来也不健康
+      - ET_RPC_PORTAL=${ET_RPC_PORTAL:-0.0.0.0:15888}
+      # 客户端白名单，默认全放行（靠端口只绑宿主机 127.0.0.1 兜底）
+      - ET_RPC_PORTAL_WHITELIST=${ET_RPC_PORTAL_WHITELIST:-0.0.0.0/0,::/0}
+
+      # --- 状态目录：machine id 落在这里，必须持久化 ---
+      - ET_STATE_DIR=${ET_STATE_DIR:-/app/state}
+
+      # --- 实例配置目录 ---
+      # 本库 core 的 --config-dir 默认就是 config.d，写出来只为语义清楚：
+      # 目录存在 = core 以本地配置为权威，web 的数据库配置不会覆盖它（见文件头第 2 条）
+      - ET_CONFIG_DIR=${ET_CONFIG_DIR:-/app/config.d}
+
+      - ET_CONSOLE_LOG_LEVEL=${ET_CONSOLE_LOG_LEVEL:-info}
+
+      # --- 可选项，不在 .env 里定义就不生效 ---
+      # 节点名与 SNI
+      # - ET_HOSTNAME
+      # - ET_SNI
+      # 关闭 IPv6（默认启用）
+      # - ET_DISABLE_IPV6
+      # 关闭加密
+      # - ET_DISABLE_ENCRYPTION
+      # 文件日志
+      # - ET_FILE_LOG_DIR
+      # - ET_FILE_LOG_LEVEL
+
+    ports:
+      # EasyTier 默认监听：tcp/udp 11010、wg+ws 11011、quic+wss 11012、faketcp 11013、http3 11014
+      - "${ET_PORT_11010:-11010}:11010/tcp"
+      - "${ET_PORT_11010:-11010}:11010/udp"
+      - "${ET_PORT_11011:-11011}:11011/tcp"
+      - "${ET_PORT_11011:-11011}:11011/udp"
+      - "${ET_PORT_11012:-11012}:11012/tcp"
+      - "${ET_PORT_11012:-11012}:11012/udp"
+      - "${ET_PORT_11013:-11013}:11013/tcp"
+      - "${ET_PORT_11014:-11014}:11014/udp"
+      # RPC 管理口只开在宿主机回环地址上
+      - "127.0.0.1:${ET_RPC_PORTAL_PORT:-15888}:15888/tcp"
+
+    volumes:
+      # 实例配置文件 + 实例启停状态（easytier-state.json）
+      - easytier-config:/app/config.d
+      # machine id
+      - easytier-state:/app/state
+
+  # 单节点模式：不接 web，配置全靠 .env + 命令行参数
+  # 启动：docker compose --profile standalone up -d easytier-standalone
+  easytier-standalone:
+    <<: *core-common
+    container_name: easytier-standalone
+    profiles:
+      - standalone
+    environment:
+      # --- 必填 ---
+      - ET_NETWORK_NAME=${ET_NETWORK_NAME:?请在 .env 中设置 ET_NETWORK_NAME}
+      - ET_NETWORK_SECRET=${ET_NETWORK_SECRET:?请在 .env 中设置 ET_NETWORK_SECRET}
+
+      # --- RPC 管理口 ---
+      - ET_RPC_PORTAL=${ET_RPC_PORTAL:-0.0.0.0:15888}
+      - ET_RPC_PORTAL_WHITELIST=${ET_RPC_PORTAL_WHITELIST:-0.0.0.0/0,::/0}
+
+      # --- 状态目录：machine id 落在这里，必须持久化 ---
+      - ET_STATE_DIR=${ET_STATE_DIR:-/app/state}
+
+      # --- 实例配置目录 ---
+      - ET_CONFIG_DIR=${ET_CONFIG_DIR:-/app/config.d}
+
+      - ET_CONSOLE_LOG_LEVEL=${ET_CONSOLE_LOG_LEVEL:-info}
+
+      # --- 可选项，不在 .env 里定义就不生效 ---
+      # 连接的节点，例：ET_PEERS=tcp://1.2.3.4:11010,udp://5.6.7.8:11010
+      # - ET_PEERS
+      # 网关地址，例：ET_IPV4=10.144.144.1
+      # - ET_IPV4
+      # 出口节点，例：ET_EXIT_NODES=tcp://1.2.3.4:11010
+      # - ET_EXIT_NODES
+      # 手工指定监听，例：ET_LISTENERS=udp://0.0.0.0:11010,wg://0.0.0.0:11011
+      # - ET_LISTENERS
+      # 只当代理不做网关（此时不需要 tun 设备，删掉上面的 devices 一段）
+      # - ET_NO_TUN
+      # 代理网段（仅 ET_NO_TUN 模式有意义），例：192.168.31.0/24
+      # - ET_PROXY_NETWORKS
+      # 节点名与 SNI
+      # - ET_HOSTNAME
+      # - ET_SNI
+      # 关闭 IPv6（默认启用）
+      # - ET_DISABLE_IPV6
+      # 关闭加密
+      # - ET_DISABLE_ENCRYPTION
+      # 文件日志
+      # - ET_FILE_LOG_DIR
+      # - ET_FILE_LOG_LEVEL
+
+    ports:
+      - "${ET_PORT_11010:-11010}:11010/tcp"
+      - "${ET_PORT_11010:-11010}:11010/udp"
+      - "${ET_PORT_11011:-11011}:11011/tcp"
+      - "${ET_PORT_11011:-11011}:11011/udp"
+      - "${ET_PORT_11012:-11012}:11012/tcp"
+      - "${ET_PORT_11012:-11012}:11012/udp"
+      - "${ET_PORT_11013:-11013}:11013/tcp"
+      - "${ET_PORT_11014:-11014}:11014/udp"
+      - "127.0.0.1:${ET_RPC_PORTAL_PORT:-15888}:15888/tcp"
+
+    volumes:
+      - easytier-config:/app/config.d
+      - easytier-state:/app/state
+
+volumes:
+  easytier-config:
+  easytier-state:
+  easytier-web-data:
